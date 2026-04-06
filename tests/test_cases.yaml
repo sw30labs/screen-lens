@@ -1,0 +1,241 @@
+# Test Cases for ScreenLens Pipeline
+# Used by test_pipeline.py and can be fed to a computer-use agent
+# for automated end-to-end testing.
+
+pipeline:
+  name: "ScreenLens — Local Video Scene Intelligence"
+  version: "0.1.0"
+
+# ─── Input Configuration ───────────────────────────────────────────────
+input:
+  video_file: "Screen Recording 2026-04-04 at 8.33.55 AM.mov"
+  description: "Screen recording of an application demonstration"
+
+# ─── Pipeline Configuration Variants ───────────────────────────────────
+configs:
+  fast:
+    description: "Quick test — low FPS, fewer frames"
+    frame_extraction:
+      fps: 0.2  # 1 frame every 5 seconds
+      max_dimension: 640
+    captioning:
+      model: "llama3.2-vision"
+      max_tokens: 256
+    embedding:
+      model_name: "ViT-B-32"
+      device: "mps"
+
+  standard:
+    description: "Standard quality — 1 fps"
+    frame_extraction:
+      fps: 1.0
+      max_dimension: 1280
+    captioning:
+      model: "llama3.2-vision"
+      max_tokens: 512
+    embedding:
+      model_name: "ViT-B-32"
+      device: "mps"
+
+  high_quality:
+    description: "Maximum detail — 2 fps, larger CLIP model"
+    frame_extraction:
+      fps: 2.0
+      max_dimension: 1920
+    captioning:
+      model: "llama3.2-vision"
+      max_tokens: 1024
+    embedding:
+      model_name: "ViT-L-14"
+      pretrained: "laion2b_s32b_b82k"
+      device: "mps"
+
+# ─── Test Cases ────────────────────────────────────────────────────────
+test_cases:
+  # ── Ingestion Tests ──
+  - id: "TC-001"
+    name: "Basic video ingestion"
+    category: "ingestion"
+    command: |
+      python -m src.cli ingest "{video_file}" --fps 0.2 --device mps
+    expected:
+      exit_code: 0
+      output_contains:
+        - "Extracting frames"
+        - "Captioning frames"
+        - "Ingestion complete"
+      data_created:
+        - "data/frames/frame_000000.jpg"
+        - "data/captions/all_captions.json"
+
+  - id: "TC-002"
+    name: "Frame count validation"
+    category: "ingestion"
+    description: "Verify correct number of frames extracted for video duration"
+    command: |
+      python -c "
+      import json
+      with open('data/captions/all_captions.json') as f:
+          frames = json.load(f)
+      print(f'Frames: {len(frames)}')
+      assert len(frames) > 0, 'No frames extracted'
+      # At 0.2 fps, a 30-min video should produce ~360 frames
+      print('PASS')
+      "
+    expected:
+      exit_code: 0
+      output_contains: ["PASS"]
+
+  - id: "TC-003"
+    name: "Caption quality check"
+    category: "ingestion"
+    description: "Verify captions contain meaningful descriptions"
+    command: |
+      python -c "
+      import json
+      with open('data/captions/all_captions.json') as f:
+          frames = json.load(f)
+      for f in frames[:5]:
+          caption = f.get('caption', '')
+          assert len(caption) > 20, f'Caption too short: {caption}'
+          assert '[Error' not in caption, f'Caption error: {caption}'
+      print(f'Checked {min(5, len(frames))} captions — all valid')
+      print('PASS')
+      "
+    expected:
+      exit_code: 0
+      output_contains: ["PASS"]
+
+  # ── Search Tests ──
+  - id: "TC-010"
+    name: "Basic semantic search"
+    category: "search"
+    command: |
+      python -m src.cli search "What application is shown?" --top-k 5
+    expected:
+      exit_code: 0
+      output_contains:
+        - "Score"
+        - "Caption"
+
+  - id: "TC-011"
+    name: "UI element search"
+    category: "search"
+    command: |
+      python -m src.cli search "buttons and menus on screen" --top-k 5
+    expected:
+      exit_code: 0
+      output_contains: ["Score"]
+
+  - id: "TC-012"
+    name: "Text content search"
+    category: "search"
+    command: |
+      python -m src.cli search "any text or labels visible on screen" --top-k 3
+    expected:
+      exit_code: 0
+      output_contains: ["Score"]
+
+  - id: "TC-013"
+    name: "Action search"
+    category: "search"
+    command: |
+      python -m src.cli search "user clicking or interacting with something" --top-k 5
+    expected:
+      exit_code: 0
+      output_contains: ["Score"]
+
+  # ── Summarization Tests ──
+  - id: "TC-020"
+    name: "Video summary generation"
+    category: "summarization"
+    command: |
+      python -m src.cli search "Summarize what happens in this video" --top-k 10
+    expected:
+      exit_code: 0
+      output_contains: ["Summary"]
+
+  - id: "TC-021"
+    name: "Step-by-step workflow extraction"
+    category: "summarization"
+    command: |
+      python -m src.cli search "What are the steps shown in this demonstration?" --top-k 15
+    expected:
+      exit_code: 0
+      output_contains: ["Summary"]
+
+  # ── Edge Cases ──
+  - id: "TC-030"
+    name: "Empty query handling"
+    category: "edge_case"
+    command: |
+      python -m src.cli search ""
+    expected:
+      exit_code: 0
+
+  - id: "TC-031"
+    name: "Vector store info"
+    category: "edge_case"
+    command: |
+      python -m src.cli info
+    expected:
+      exit_code: 0
+      output_contains:
+        - "Frames stored"
+        - "Collection"
+
+# ─── Computer-Use Agent Script ─────────────────────────────────────────
+# This section defines steps for an automated agent (e.g., Claude computer-use)
+# to execute the full test suite end-to-end.
+
+agent_script:
+  name: "ScreenLens End-to-End Test Agent"
+  description: "Automated test script for computer-use agent"
+
+  pre_conditions:
+    - "Ollama is running with llama3.2-vision and llama3.2 models loaded"
+    - "Python 3.11+ is installed with all dependencies"
+    - "The test video file exists in the project directory"
+
+  steps:
+    - step: 1
+      action: "Open terminal"
+      command: "cd screenlens"
+      verify: "Terminal shows correct directory"
+
+    - step: 2
+      action: "Verify Ollama is running"
+      command: "curl -s http://127.0.0.1:11434/api/tags | python -m json.tool"
+      verify: "Output shows available models including llama3.2-vision"
+
+    - step: 3
+      action: "Run fast ingestion"
+      command: "python -m src.cli ingest 'Screen Recording 2026-04-04 at 8.33.55 AM.mov' --fps 0.2 --device mps"
+      verify: "Output shows 'Ingestion complete' with frame count and timing"
+      timeout: 600
+
+    - step: 4
+      action: "Verify data created"
+      command: "ls -la data/frames/ | head -20 && cat data/captions/all_captions.json | python -c 'import json,sys; d=json.load(sys.stdin); print(f\"{len(d)} captions\")'"
+      verify: "Frame files exist and caption count matches"
+
+    - step: 5
+      action: "Run search test"
+      command: "python -m src.cli search 'What application is being demonstrated?' --top-k 5"
+      verify: "Results table displayed with scores and captions"
+
+    - step: 6
+      action: "Run summary test"
+      command: "python -m src.cli search 'Summarize the entire video' --top-k 10"
+      verify: "Summary panel displayed with coherent description"
+
+    - step: 7
+      action: "Check vector store"
+      command: "python -m src.cli info"
+      verify: "Shows collection name, frame count, and time range"
+
+  post_conditions:
+    - "data/frames/ contains extracted frame images"
+    - "data/captions/all_captions.json contains frame metadata with captions"
+    - "data/chromadb/ contains persistent vector store"
+    - "Search queries return relevant results with similarity scores"

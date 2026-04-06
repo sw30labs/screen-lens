@@ -1,0 +1,32 @@
+[project]
+name = "screenlens"
+version = "0.2.0"
+description = "ScreenLens — Local video scene intelligence for Apple Silicon"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=0.4",
+    "langchain>=0.3",
+    "langchain-ollama>=0.3",
+    "langchain-community>=0.3",
+    "chromadb>=0.6",
+    "open-clip-torch>=2.29",
+    "opencv-python-headless>=4.10",
+    "scikit-image>=0.24",
+    "Pillow>=10.0",
+    "numpy>=1.26",
+    "torch>=2.4",
+    "tqdm>=4.66",
+    "typer>=0.12",
+    "rich>=13.0",
+    "pydantic>=2.0",
+    # MLX-VLM for Qwen3.5 vision (Apple Silicon)
+    "mlx-vlm>=0.4",
+    "huggingface-hub>=0.25",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "pyyaml>=6.0"]
+ollama-only = []  # No mlx-vlm needed if using Ollama backend exclusively
+
+[project.scripts]
+screenlens = "src.cli:app"

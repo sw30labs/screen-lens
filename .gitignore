@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Data / artifacts (large generated files)
+data/
+
+# Video files
+*.mov
+*.mp4
+*.avi
+*.mkv
+*.webm
+
+# Model caches
+.cache/
+*.ckpt
+*.safetensors
+*.bin
+
+# Misc
+.env
+*.log
