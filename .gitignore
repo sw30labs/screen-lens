@@ -24,12 +24,18 @@ env/
 # Data / artifacts (large generated files)
 data/
 
+# Input videos folder
+input-videos/
+
 # Video files
 *.mov
 *.mp4
 *.avi
 *.mkv
 *.webm
+*.m4v
+*.flv
+*.wmv
 
 # Model caches
 .cache/

@@ -54,7 +54,7 @@ class CaptioningConfig(BaseModel):
     )
     # MLX-VLM settings (Qwen3.5)
     mlx_repo_id: str = Field(
-        default="mlx-community/Qwen3.5-35B-A3B-4bit",
+        default="mlx-community/Qwen3.5-122B-A10B-bf16",
         description="HuggingFace repo ID for the MLX vision model"
     )
     mlx_model_path: Optional[str] = Field(

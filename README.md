@@ -96,7 +96,7 @@ pip install -e .
 python -m src.cli ingest "Screen Recording 2026-04-04 at 8.33.55 AM.mov"
 ```
 
-This uses smart keyframe detection (only captures when the screen actually changes) and Qwen3.5-35B-A3B via MLX for high-fidelity captions.
+This uses smart keyframe detection (only captures when the screen actually changes) and Qwen3.5-122B-A10B via MLX for high-fidelity captions.
 
 ### 2. Ingest with Ollama (alternative)
 
@@ -104,13 +104,21 @@ This uses smart keyframe detection (only captures when the screen actually chang
 python -m src.cli ingest "video.mov" --backend ollama --strategy fixed_fps --fps 1.0
 ```
 
-### 3. Use the larger Qwen3.5 model
+### 3. Use a smaller Qwen3.5 model
 
 ```bash
-python -m src.cli ingest "video.mov" --mlx-repo mlx-community/Qwen3.5-122B-A10B-MLX-4bit
+python -m src.cli ingest "video.mov" --mlx-repo mlx-community/Qwen3.5-35B-A3B-4bit
 ```
 
-### 4. Search the Video
+### 4. Batch-Ingest a Folder of Videos
+
+```bash
+python -m src.cli batch "/path/to/recordings/"
+```
+
+Each video gets its own data directory under `./data/<video_name>/` with separate frames, captions, embeddings, and ChromaDB collections.
+
+### 5. Search the Video
 
 ```bash
 python -m src.cli search "What application is being demonstrated?"
@@ -118,13 +126,26 @@ python -m src.cli search "Show me any error messages or warnings"
 python -m src.cli search "What buttons or menus are visible?"
 ```
 
-### 5. One-Shot (Ingest + Search)
+### 6. One-Shot (Ingest + Search)
 
 ```bash
 python -m src.cli run "video.mov" "Summarize what happens in this screen recording"
 ```
 
-### 6. Check Status
+### 7. Reconstruct Artifacts from Recordings
+
+```bash
+python -m src.cli reconstruct
+```
+
+Scans all folders in `./data/`, classifies each recording (Python code, Markdown doc, PDF, or GUI demo), and uses LangGraph deep agents to reconstruct the original artifacts. Features:
+
+- **Classification** — Auto-detects content type from captions
+- **Parallel sub-agents** — Fan-out via LangGraph `Send` when tasks are independent
+- **Reflection QA** — Up to 3 iterations of quality review before saving
+- **Output** — Reconstructed files saved to `./data/<video_name>/output/`
+
+### 8. Check Status
 
 ```bash
 python -m src.cli info
