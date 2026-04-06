@@ -4,7 +4,7 @@
 [![Apple Silicon](https://img.shields.io/badge/Apple_Silicon-MPS-000000?logo=apple&logoColor=white)](https://developer.apple.com/metal/)
 [![LangGraph](https://img.shields.io/badge/LangGraph-Pipeline-1C3C3C?logo=langchain&logoColor=white)](https://github.com/langchain-ai/langgraph)
 [![Version](https://img.shields.io/badge/version-0.2.0-blue)]()
-[![Author](https://img.shields.io/badge/Author-Nicolas_Cravino-orange)](https://github.com/nicolascravino)
+[![Author](https://img.shields.io/badge/Author-Nicolas_Cravino-orange)](https://github.com/ai-agents-cybersecurity)
 [![Assisted by Claude](https://img.shields.io/badge/Assisted_by-Claude-blueviolet?logo=anthropic&logoColor=white)](https://anthropic.com)
 [![License](https://img.shields.io/badge/License-Apache_2.0-green.svg)](LICENSE)
 
