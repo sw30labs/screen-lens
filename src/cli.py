@@ -12,6 +12,7 @@ Usage:
 """
 import json
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -37,6 +38,21 @@ def _load_config(config_path: Optional[str] = None) -> ScreenLensConfig:
         with open(config_path) as f:
             return ScreenLensConfig(**json.load(f))
     return ScreenLensConfig()
+
+
+def _apply_video_slug(config: ScreenLensConfig, video: Path) -> str:
+    """Point config at a per-video slugged subfolder under ./data/.
+
+    Uses ``<video_stem>_<YYYYMMDD_HHMMSS>`` so repeated ingests of the same
+    video do not clobber each other. Mutates ``config`` in place and returns
+    the slug.
+    """
+    base_slug = video.stem.replace(" ", "_")
+    slug = f"{base_slug}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    config.data_dir = Path(f"./data/{slug}")
+    config.vector_db.persist_directory = str(config.data_dir / "chromadb")
+    config.vector_db.collection_name = f"screenlens_{base_slug}"
+    return slug
 
 
 @app.command()
@@ -81,6 +97,9 @@ def ingest(
     # Embedding
     config.embedding.device = device
 
+    # Per-video slugged data directory (consistent with `batch`)
+    slug = _apply_video_slug(config, video)
+
     # Display config
     if backend == "mlx_vlm":
         model_display = mlx_repo.split("/")[-1]
@@ -90,6 +109,7 @@ def ingest(
     console.print(Panel.fit(
         f"[bold green]ScreenLens — Video Ingestion[/bold green]\n"
         f"Video: {video.name} ({video.stat().st_size / (1024**2):.0f} MB)\n"
+        f"Output: {config.data_dir}\n"
         f"Extraction: {strategy} | Captioning: {backend} ({model_display})\n"
         f"CLIP device: {device}",
         title="Configuration",
@@ -199,6 +219,9 @@ def run(
     config.captioning.backend = CaptionBackend(backend)
     config.captioning.mlx_repo_id = mlx_repo
     config.embedding.device = device
+
+    # Per-video slugged data directory (consistent with `ingest` / `batch`)
+    _apply_video_slug(config, video)
 
     pipeline = build_full_graph()
     state = {
@@ -311,11 +334,8 @@ def batch(
         config.captioning.batch_size = batch_size
         config.embedding.device = device
 
-        # Per-video data directory
-        video_slug = video.stem.replace(" ", "_")
-        config.data_dir = Path(f"./data/{video_slug}")
-        config.vector_db.persist_directory = str(config.data_dir / "chromadb")
-        config.vector_db.collection_name = f"screenlens_{video_slug}"
+        # Per-video slugged data directory (shared with `ingest` / `run`)
+        _apply_video_slug(config, video)
 
         pipeline = build_ingest_graph()
         initial_state = {

@@ -27,6 +27,10 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 
 from .config import ScreenLensConfig
+# Reuse the chunk-strategy math from the summarization pipeline. It's the same
+# token-budget problem (fit a long caption stream into a fixed model context),
+# so we deliberately share the helper rather than duplicate the constants.
+from .pipeline import _compute_chunk_strategy
 
 logger = logging.getLogger("screenlens.reconstruct")
 
@@ -41,6 +45,15 @@ CONTENT_TYPES = {
 }
 
 MAX_QA_ITERATIONS = 3
+
+# Cap on captions per Pass-1 extraction chunk. ``_compute_chunk_strategy``
+# maximizes chunk size to minimize chunk count, which on a model with a
+# very large context window (e.g. Qwen3.5-122B at ~256k tokens) yields
+# chunks of 200+ captions. Each chunk only gets ~2k output tokens of
+# extraction notes, so oversized chunks force the model into aggressive
+# compression and lose specifics. This cap keeps extraction fidelity
+# bounded regardless of model context size.
+MAX_CAPTIONS_PER_CHUNK = 50
 
 
 # ── System Prompts ───────────────────────────────────────────────────────────
@@ -137,6 +150,30 @@ RECONSTRUCT_DEMO_REFERENCE_SYSTEM = (
     "Focus on factual, reference-style documentation. No narrative."
 )
 
+EXTRACT_SEGMENT_SYSTEM = (
+    "You are extracting raw content from a portion of a screen recording for "
+    "later artifact reconstruction. The user prompt provides either frame "
+    "captions for a video segment or extraction notes from a section of the "
+    "recording.\n\n"
+    "Your job: produce structured notes that preserve everything concrete. A "
+    "separate synthesis pass will combine your notes with notes from other "
+    "sections to build the final artifact, so anything you skip is "
+    "permanently lost from the final output.\n\n"
+    "CRITICAL RULES:\n"
+    "1. EXTRACT, do not summarize. Preserve exact text, code, file names, UI "
+    "labels, button names, paths, user inputs, system outputs, configuration "
+    "values, error messages, numerical values.\n"
+    "2. Reference timestamps (e.g. [00:01:23]) for concrete events whenever "
+    "they appear in the input.\n"
+    "3. Do not invent. If something is not in the input, do not include it.\n"
+    "4. Be COMPACT in formatting: short bullet points, no narrative prose, "
+    "no preamble, no commentary, no closing remarks.\n"
+    "5. Group repeated observations: if the same UI element or status appears "
+    "across many frames, note it once with the relevant timestamp range.\n"
+    "6. Output ONLY the notes — no headings like 'EXTRACTION NOTES:'."
+)
+
+
 QA_REFLECT_SYSTEM = (
     "You are a quality assurance specialist reviewing reconstructed artifacts against "
     "the original screen recording frame captions.\n\n"
@@ -176,6 +213,12 @@ class ReconstructState(TypedDict, total=False):
     system_prompt: str
     reconstruction_tasks: list[dict]
     parallel_safe: bool
+
+    # Hierarchical Pass-1 cache. Populated once per recording on the first
+    # reconstruction iteration; reused unchanged across QA retries because the
+    # captions don't change between iterations — only the QA feedback does, and
+    # that flows through Pass 2 (synthesis), not Pass 1 (extraction).
+    segment_notes: list[str]
 
     # Sub-agent output — uses add reducer for parallel fan-out collection
     artifacts: Annotated[list[dict], operator.add]
@@ -283,6 +326,224 @@ def _build_caption_block(captions: list[dict], max_chars: int = 80000) -> str:
     return "\n\n---\n\n".join(parts)
 
 
+def _stratified_sample(items: list, n: int) -> list:
+    """Pick ``n`` items spread evenly across ``items``, preserving order.
+
+    Used by the QA reflector and ``plan_node``'s python file-identification
+    step to give visibility into the entire recording's timeline rather than
+    only the opening frames. Always includes the first and last items when
+    ``n >= 2`` so endpoint context is preserved.
+    """
+    total = len(items)
+    if total <= n:
+        return list(items)
+    if n <= 1:
+        return [items[total // 2]]
+    step = (total - 1) / (n - 1)
+    return [items[int(round(i * step))] for i in range(n)]
+
+
+def _chunk_list(items: list, chunk_size: int) -> list[list]:
+    """Split items into contiguous chunks of at most ``chunk_size``."""
+    return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+
+def _get_model_context_size(model) -> int:
+    """Detect the model's maximum context window from its config.
+
+    Mirrors the introspection used by ``summarize_all_node`` in pipeline.py:
+    walks common attribute names on ``model.config`` and the nested
+    ``text_config`` (common in VLM architectures), returning the first
+    plausible value found. Falls back to 32768 if introspection fails.
+    """
+    model_context = 32768  # conservative default
+    try:
+        if hasattr(model, "config"):
+            mc = model.config
+            for attr in ("max_position_embeddings", "max_seq_len", "seq_length",
+                         "model_max_length", "max_length"):
+                val = getattr(mc, attr, None)
+                if val and isinstance(val, int) and val > 1024:
+                    model_context = val
+                    break
+            if hasattr(mc, "text_config"):
+                for attr in ("max_position_embeddings", "max_seq_len"):
+                    val = getattr(mc.text_config, attr, None)
+                    if val and isinstance(val, int) and val > 1024:
+                        model_context = val
+                        break
+    except Exception:
+        pass
+    return model_context
+
+
+def _extract_segment_notes(
+    captions: list[dict],
+    model,
+    tokenizer,
+    model_context: int,
+) -> list[str]:
+    """Pass 1 of hierarchical reconstruction: extract content notes per chunk.
+
+    Uses ``_compute_chunk_strategy`` to size chunks against the model's
+    context window. Each chunk gets a single MLX call producing structured
+    extraction notes (raw content, no synthesis). The result is a list of
+    notes — one per chunk — that downstream synthesis passes consume.
+
+    Task-agnostic by design: the same extraction is reused across all tasks
+    in a single iteration AND across QA retries (cached in state). This
+    avoids re-paying the dominant cost of the pipeline when only the
+    synthesis prompt changes.
+    """
+    strategy = _compute_chunk_strategy(captions, model_context)
+
+    # Cap chunk_size for fidelity (see MAX_CAPTIONS_PER_CHUNK comment).
+    if (strategy["strategy"] == "hierarchical"
+            and strategy["chunk_size"] > MAX_CAPTIONS_PER_CHUNK):
+        strategy["chunk_size"] = MAX_CAPTIONS_PER_CHUNK
+        strategy["num_chunks"] = -(-len(captions) // MAX_CAPTIONS_PER_CHUNK)
+
+    print(f"    [Pass 1] strategy={strategy['strategy']} "
+          f"chunk_size={strategy['chunk_size']} "
+          f"chunks={strategy['num_chunks']}")
+
+    if strategy["strategy"] == "single_pass":
+        # Whole recording fits in one call. Still use the extraction prompt so
+        # the downstream synthesis pipeline sees a uniform input format.
+        all_block = "\n\n---\n\n".join(
+            f"[{c.get('timestamp_str', '?')}]\n{c.get('caption', '')}"
+            for c in captions
+        )
+        user = (
+            f"Frame captions covering the entire recording "
+            f"({len(captions)} frames):\n\n{all_block}"
+        )
+        notes = _mlx_generate(
+            model, tokenizer, EXTRACT_SEGMENT_SYSTEM, user,
+            max_tokens=4096, temperature=0.1,
+        )
+        return [f"[Full recording]\n{notes}"]
+
+    chunks = _chunk_list(captions, strategy["chunk_size"])
+    segment_notes: list[str] = []
+
+    for i, chunk in enumerate(chunks, 1):
+        start_ts = chunk[0].get("timestamp_str", "?")
+        end_ts = chunk[-1].get("timestamp_str", "?")
+
+        chunk_block = "\n\n---\n\n".join(
+            f"[{c.get('timestamp_str', '?')}]\n{c.get('caption', '')}"
+            for c in chunk
+        )
+        user = (
+            f"Segment {i} of {len(chunks)} from a longer recording "
+            f"(timestamps {start_ts} — {end_ts}, {len(chunk)} frames). "
+            f"Extract every concrete detail from this segment that could be "
+            f"needed to reconstruct the artifacts shown in the recording.\n\n"
+            f"SEGMENT CAPTIONS:\n\n{chunk_block}"
+        )
+        t0 = time.time()
+        notes = _mlx_generate(
+            model, tokenizer, EXTRACT_SEGMENT_SYSTEM, user,
+            max_tokens=2048, temperature=0.1,
+        )
+        elapsed = time.time() - t0
+        segment_notes.append(f"[Segment {i}: {start_ts} — {end_ts}]\n{notes}")
+        print(f"    [Pass 1] segment {i}/{len(chunks)} done "
+              f"({len(notes)} chars, {elapsed:.1f}s)")
+
+    return segment_notes
+
+
+def _hierarchical_synthesize(
+    notes: list[str],
+    task_user_prefix: str,
+    task_system_prompt: str,
+    model,
+    tokenizer,
+    model_context: int,
+    max_output_tokens: int = 32768,
+) -> str:
+    """Pass 2 of hierarchical reconstruction: synthesize segment notes into a
+    final artifact, recursing if the notes don't all fit in one call.
+
+    Single pass when the notes fit in the model's safe input budget.
+    Otherwise: group notes into super-chunks, run an intermediate synthesis
+    on each (using EXTRACT_SEGMENT_SYSTEM to preserve detail rather than
+    finalize), then recurse on the intermediate notes. The recursion is
+    guaranteed to terminate because each pass strictly reduces the total
+    token count (by collapsing several detailed notes into one denser note).
+    """
+    OVERHEAD_TOKENS = 2548  # system prompt + chat template + safety margin
+    safe_input_tokens = max(
+        2048,
+        int((model_context - OVERHEAD_TOKENS - max_output_tokens) * 0.85),
+    )
+
+    total_chars = sum(len(n) + 50 for n in notes)  # +50 per separator
+    estimated_tokens = total_chars // 4
+
+    if estimated_tokens <= safe_input_tokens or len(notes) <= 1:
+        # Single synthesis pass — all notes fit
+        notes_block = "\n\n---\n\n".join(notes)
+        user = (
+            f"{task_user_prefix}\n\n"
+            f"You are working from segment-by-segment extraction notes covering "
+            f"the entire recording in chronological order. Each segment's notes "
+            f"contain raw extracted content with timestamps. Combine information "
+            f"across all segments to produce the final artifact.\n\n"
+            f"SEGMENT NOTES:\n\n{notes_block}"
+        )
+        return _mlx_generate(
+            model, tokenizer, task_system_prompt, user,
+            max_tokens=max_output_tokens, temperature=0.1,
+        )
+
+    # Recursive group-and-condense. Choose a group size that leaves headroom
+    # for the intermediate synthesis output, then recurse on the result.
+    avg_chars_per_note = total_chars / len(notes)
+    notes_per_group = max(
+        2,
+        int((safe_input_tokens * 4) / avg_chars_per_note * 0.7),
+    )
+
+    print(f"    [Pass 2] {len(notes)} notes (~{estimated_tokens:,} tok) "
+          f"exceed budget — recursing in groups of {notes_per_group}")
+
+    groups = _chunk_list(notes, notes_per_group)
+    intermediate_notes: list[str] = []
+
+    for i, group in enumerate(groups, 1):
+        group_block = "\n\n---\n\n".join(group)
+        intermediate_user = (
+            f"You are merging extraction notes from one section of a longer "
+            f"recording (section {i} of {len(groups)}). Produce dense "
+            f"intermediate notes that consolidate and preserve the concrete "
+            f"information from this section. These notes will be combined with "
+            f"intermediate notes from other sections in a later pass — do not "
+            f"finalize the artifact, do not summarize, do not drop specifics.\n\n"
+            f"PRESERVE: text content, code, file names, UI labels, timestamps, "
+            f"user inputs, system outputs, configuration values.\n\n"
+            f"SECTION NOTES:\n\n{group_block}"
+        )
+        t0 = time.time()
+        result = _mlx_generate(
+            model, tokenizer, EXTRACT_SEGMENT_SYSTEM, intermediate_user,
+            max_tokens=2048, temperature=0.1,
+        )
+        intermediate_notes.append(f"[Section {i} of {len(groups)}]\n{result}")
+        elapsed = time.time() - t0
+        print(f"    [Pass 2] intermediate {i}/{len(groups)} done "
+              f"({len(result)} chars, {elapsed:.1f}s)")
+
+    # Recurse — guaranteed to terminate because intermediate notes are denser
+    # than the inputs (capped at 2048 output tokens vs many more input tokens).
+    return _hierarchical_synthesize(
+        intermediate_notes, task_user_prefix, task_system_prompt,
+        model, tokenizer, model_context, max_output_tokens,
+    )
+
+
 # ── Pipeline Nodes ───────────────────────────────────────────────────────────
 
 def classify_node(state: ReconstructState) -> dict:
@@ -351,8 +612,6 @@ def plan_node(state: ReconstructState) -> dict:
         print(f"      Retry #{qa_iteration} — incorporating QA feedback")
     print(f"{'='*60}")
 
-    caption_block = _build_caption_block(captions)
-
     tasks = []
     parallel_safe = False
     system_prompt = ""
@@ -360,8 +619,11 @@ def plan_node(state: ReconstructState) -> dict:
     if content_type == "python_code":
         system_prompt = RECONSTRUCT_PYTHON_SYSTEM
 
-        # Ask LLM to identify distinct files from captions
-        file_id_prompt = f"Frame captions from a Python coding session:\n\n{caption_block}"
+        # File identification needs visibility into the whole recording, so
+        # use a stratified sample rather than the linear opening slice.
+        sampled = _stratified_sample(captions, 60)
+        sample_block = _build_caption_block(sampled, max_chars=80000)
+        file_id_prompt = f"Frame captions from a Python coding session:\n\n{sample_block}"
         response = _mlx_generate(model, tokenizer, PLAN_PYTHON_SYSTEM,
                                   file_id_prompt, max_tokens=1024, temperature=0.1)
         plan = _parse_json_response(response)
@@ -378,7 +640,6 @@ def plan_node(state: ReconstructState) -> dict:
                 task_prompt += (
                     f"PREVIOUS QA FEEDBACK — address these issues:\n{qa_feedback}\n\n"
                 )
-            task_prompt += f"Frame captions:\n\n{caption_block}"
 
             tasks.append({
                 "filename": f["filename"],
@@ -398,7 +659,6 @@ def plan_node(state: ReconstructState) -> dict:
         task_prompt = "Reconstruct the complete Markdown document.\n\n"
         if qa_feedback and qa_iteration > 0:
             task_prompt += f"PREVIOUS QA FEEDBACK — address these issues:\n{qa_feedback}\n\n"
-        task_prompt += f"Frame captions:\n\n{caption_block}"
 
         tasks.append({
             "filename": "document.md",
@@ -414,7 +674,6 @@ def plan_node(state: ReconstructState) -> dict:
         task_prompt = "Reconstruct the PDF document content in Markdown format.\n\n"
         if qa_feedback and qa_iteration > 0:
             task_prompt += f"PREVIOUS QA FEEDBACK — address these issues:\n{qa_feedback}\n\n"
-        task_prompt += f"Frame captions:\n\n{caption_block}"
 
         tasks.append({
             "filename": "document.md",
@@ -430,7 +689,6 @@ def plan_node(state: ReconstructState) -> dict:
         base_context = ""
         if qa_feedback and qa_iteration > 0:
             base_context = f"PREVIOUS QA FEEDBACK — address these issues:\n{qa_feedback}\n\n"
-        base_context += f"Frame captions:\n\n{caption_block}"
 
         tasks.append({
             "filename": "walkthrough.md",
@@ -461,22 +719,37 @@ def plan_node(state: ReconstructState) -> dict:
 
 
 def reconstruct_worker(state: dict) -> dict:
-    """Execute a single reconstruction task. Invoked via LangGraph Send for parallel fan-out."""
+    """Execute a single reconstruction task via LangGraph Send for parallel fan-out.
+
+    Currently unreachable: ``route_to_workers`` always dispatches sequentially
+    because MLX inference is not reentrant on a shared cached model. Kept in
+    sync with ``reconstruct_sequential`` so that re-enabling parallel dispatch
+    (with per-worker model instances) wouldn't silently regress.
+    """
     task = state["task"]
     config = ScreenLensConfig(**state["config"])
     model, tokenizer = _get_mlx_model(config)
+    captions = state.get("captions", [])
+    segment_notes = state.get("segment_notes") or []
+    model_context = _get_model_context_size(model)
 
-    system = task.get("system_override", state.get("system_prompt", ""))
-    user = task["prompt"]
+    if not segment_notes and captions:
+        segment_notes = _extract_segment_notes(captions, model, tokenizer, model_context)
+
+    task_system = task.get("system_override", state.get("system_prompt", ""))
+    task_user_prefix = task["prompt"]
 
     print(f"    [sub-agent] Reconstructing: {task['filename']}")
     t0 = time.time()
 
-    content = _mlx_generate(model, tokenizer, system, user,
-                             max_tokens=8192, temperature=0.1)
+    content = _hierarchical_synthesize(
+        segment_notes, task_user_prefix, task_system,
+        model, tokenizer, model_context,
+    )
 
     elapsed = time.time() - t0
-    print(f"    [sub-agent] {task['filename']} done ({len(content)} chars, {elapsed:.1f}s)")
+    print(f"    [sub-agent] {task['filename']} done "
+          f"({len(content)} chars, {elapsed:.1f}s)")
 
     return {
         "artifacts": [{
@@ -486,32 +759,65 @@ def reconstruct_worker(state: dict) -> dict:
             "description": task.get("description", ""),
             "iteration": state.get("qa_iteration", 0),
         }],
+        "segment_notes": segment_notes,
     }
 
 
 def reconstruct_sequential(state: ReconstructState) -> dict:
-    """Process all reconstruction tasks sequentially when parallel dispatch isn't safe."""
+    """Process all reconstruction tasks sequentially via hierarchical synthesis.
+
+    Two-pass design:
+      Pass 1 — extract structured content notes from each chunk of captions
+               (task-agnostic, shared across all tasks). Cached in state and
+               reused on QA retries since the captions don't change between
+               iterations.
+      Pass 2 — for each task, hierarchically synthesize the segment notes
+               into the final artifact, using the task's system prompt and
+               any QA feedback embedded in the task user prompt.
+    """
     config = ScreenLensConfig(**state["config"])
     model, tokenizer = _get_mlx_model(config)
+    captions = state["captions"]
     tasks = state["reconstruction_tasks"]
     system_prompt = state.get("system_prompt", "")
     qa_iteration = state.get("qa_iteration", 0)
 
-    print(f"\n  Processing {len(tasks)} task(s) sequentially...")
+    model_context = _get_model_context_size(model)
+    print(f"\n  Processing {len(tasks)} task(s) sequentially "
+          f"(model context: {model_context:,} tokens)")
 
+    # Pass 1: extract segment notes once per recording. Cached across QA
+    # retries because the captions are stable — only the synthesis prompt
+    # changes between iterations.
+    segment_notes = state.get("segment_notes") or []
+    if not segment_notes:
+        print(f"  [Pass 1] Extracting segment notes from {len(captions)} captions...")
+        t1 = time.time()
+        segment_notes = _extract_segment_notes(
+            captions, model, tokenizer, model_context,
+        )
+        print(f"  [Pass 1] Produced {len(segment_notes)} segment notes "
+              f"in {time.time() - t1:.1f}s")
+    else:
+        print(f"  [Pass 1] Reusing {len(segment_notes)} cached segment notes "
+              f"(QA iteration {qa_iteration})")
+
+    # Pass 2: per-task synthesis from the shared segment notes.
     new_artifacts = []
     for i, task in enumerate(tasks, 1):
-        system = task.get("system_override", system_prompt)
-        user = task["prompt"]
+        task_system = task.get("system_override", system_prompt)
+        task_user_prefix = task["prompt"]
 
-        print(f"    [{i}/{len(tasks)}] Reconstructing: {task['filename']}")
+        print(f"\n  [Pass 2] [{i}/{len(tasks)}] Synthesizing: {task['filename']}")
         t0 = time.time()
 
-        content = _mlx_generate(model, tokenizer, system, user,
-                                 max_tokens=8192, temperature=0.1)
+        content = _hierarchical_synthesize(
+            segment_notes, task_user_prefix, task_system,
+            model, tokenizer, model_context,
+        )
 
         elapsed = time.time() - t0
-        print(f"    [{i}/{len(tasks)}] {task['filename']} done "
+        print(f"  [Pass 2] [{i}/{len(tasks)}] {task['filename']} done "
               f"({len(content)} chars, {elapsed:.1f}s)")
 
         new_artifacts.append({
@@ -522,7 +828,10 @@ def reconstruct_sequential(state: ReconstructState) -> dict:
             "iteration": qa_iteration,
         })
 
-    return {"artifacts": new_artifacts}
+    return {
+        "artifacts": new_artifacts,
+        "segment_notes": segment_notes,
+    }
 
 
 def qa_reflect_node(state: ReconstructState) -> dict:
@@ -546,20 +855,34 @@ def qa_reflect_node(state: ReconstructState) -> dict:
     print(f"      Reviewing {len(current_artifacts)} artifact(s)")
     print(f"{'='*60}")
 
-    # Build QA context — abbreviated captions + full artifacts
-    caption_summary = _build_caption_block(captions[:30], max_chars=30000)
+    # Build QA context. Two important details:
+    #   1. Captions are stratified-sampled across the *entire* recording so
+    #      QA can validate content from any point in the timeline. A linear
+    #      `captions[:30]` slice would only see the opening frames and would
+    #      flag legitimate later content as "hallucinated".
+    #   2. Artifacts get a generous per-document slice so QA actually sees
+    #      the whole reconstruction. A short slice causes the reflector to
+    #      mistake its own display window for real artifact truncation.
+    sampled_captions = _stratified_sample(captions, 50)
+    caption_summary = _build_caption_block(sampled_captions, max_chars=40000)
 
+    ARTIFACT_SLICE_CHARS = 30000
     artifacts_text = ""
     for a in current_artifacts:
         artifacts_text += f"\n\n--- {a['filename']} ({a['type']}) ---\n"
-        artifacts_text += a["content"][:4000]
-        if len(a["content"]) > 4000:
-            artifacts_text += f"\n[... truncated, {len(a['content'])} total chars ...]"
+        artifacts_text += a["content"][:ARTIFACT_SLICE_CHARS]
+        if len(a["content"]) > ARTIFACT_SLICE_CHARS:
+            artifacts_text += (
+                f"\n[... truncated for QA display only, "
+                f"{len(a['content'])} total chars in saved artifact ...]"
+            )
         artifacts_text += "\n"
 
     user_prompt = (
         f"Content type: {state.get('content_type', 'unknown')}\n\n"
-        f"ORIGINAL FRAME CAPTIONS (reference):\n{caption_summary}\n\n"
+        f"ORIGINAL FRAME CAPTIONS — {len(sampled_captions)} frames sampled "
+        f"evenly across the full {len(captions)}-frame recording "
+        f"(timestamps span the entire video):\n{caption_summary}\n\n"
         f"RECONSTRUCTED ARTIFACTS:\n{artifacts_text}"
     )
 
@@ -666,24 +989,18 @@ def save_node(state: ReconstructState) -> dict:
 # ── Routing Functions ────────────────────────────────────────────────────────
 
 def route_to_workers(state: ReconstructState):
-    """Dispatch reconstruction tasks — parallel via Send when safe, else sequential."""
-    tasks = state.get("reconstruction_tasks", [])
-    parallel_safe = state.get("parallel_safe", False)
+    """Dispatch reconstruction tasks sequentially.
 
-    if parallel_safe and len(tasks) > 1:
-        print(f"\n  Dispatching {len(tasks)} parallel sub-agents")
-        return [
-            Send("reconstruct_worker", {
-                "task": task,
-                "config": state["config"],
-                "system_prompt": state.get("system_prompt", ""),
-                "qa_iteration": state.get("qa_iteration", 0),
-            })
-            for task in tasks
-        ]
-    else:
-        print(f"\n  Sequential execution ({len(tasks)} task(s))")
-        return "reconstruct_sequential"
+    The pipeline shares a single cached MLX model across all workers
+    (see ``_MODEL_CACHE``). MLX inference is not reentrant on a shared
+    model object, so parallel ``Send`` fan-out segfaults during concurrent
+    prefill. Since MLX is compute-bound and there's only one model in
+    memory, parallel dispatch never offered a real speedup either —
+    sequential is the only correct path here.
+    """
+    tasks = state.get("reconstruction_tasks", [])
+    print(f"\n  Sequential execution ({len(tasks)} task(s))")
+    return "reconstruct_sequential"
 
 
 def should_retry_or_save(state: ReconstructState) -> str:
