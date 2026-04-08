@@ -67,6 +67,18 @@ class CaptioningConfig(BaseModel):
     # Shared generation settings
     temperature: float = Field(default=0.1, description="LLM temperature for captions")
     max_tokens: int = Field(default=1024, description="Max tokens per caption")
+    batch_size: int = Field(
+        default=4,
+        description=(
+            "Frames per mlx-vlm batch_generate call (ignored by Ollama backend). "
+            "Empirically tuned on M3 Ultra 512GB with Qwen3.5-122B-A10B-bf16: "
+            "batch=4 → 1.54x speedup vs batch=1, batch=8 *regresses* to 1.22x "
+            "(likely MoE expert dispersion + compute-bound prefill). Memory is "
+            "not the bottleneck (peak ~257GB at batch=4 of 512GB UMA). Smaller "
+            "MoE models (e.g. 35B-A3B-4bit) should tolerate larger batch sizes — "
+            "re-run scripts/bench_caption_batch.py if you change mlx_repo_id."
+        ),
+    )
     system_prompt: str = Field(
         default=(
             "You are a meticulous video frame analyst. You respond ONLY with your analysis — "

@@ -54,6 +54,7 @@ def ingest(
     ),
     ollama_model: str = typer.Option("llama3.2-vision", help="Ollama vision model (if backend=ollama)"),
     ollama_url: str = typer.Option("http://127.0.0.1:11434", help="Ollama API URL"),
+    batch_size: int = typer.Option(4, help="Frames per mlx-vlm batch_generate call (MLX backend only)"),
     # Other
     device: str = typer.Option("mps", help="Device for CLIP: mps, cuda, cpu"),
     config_file: Optional[str] = typer.Option(None, help="Path to config JSON file"),
@@ -76,6 +77,7 @@ def ingest(
     config.captioning.mlx_repo_id = mlx_repo
     config.captioning.ollama_model = ollama_model
     config.captioning.ollama_base_url = ollama_url
+    config.captioning.batch_size = batch_size
     # Embedding
     config.embedding.device = device
 
@@ -264,6 +266,7 @@ def batch(
     ),
     ollama_model: str = typer.Option("llama3.2-vision", help="Ollama vision model (if backend=ollama)"),
     ollama_url: str = typer.Option("http://127.0.0.1:11434", help="Ollama API URL"),
+    batch_size: int = typer.Option(4, help="Frames per mlx-vlm batch_generate call (MLX backend only)"),
     # Other
     device: str = typer.Option("mps", help="Device for CLIP: mps, cuda, cpu"),
     config_file: Optional[str] = typer.Option(None, help="Path to config JSON file"),
@@ -305,6 +308,7 @@ def batch(
         config.captioning.mlx_repo_id = mlx_repo
         config.captioning.ollama_model = ollama_model
         config.captioning.ollama_base_url = ollama_url
+        config.captioning.batch_size = batch_size
         config.embedding.device = device
 
         # Per-video data directory

@@ -217,9 +217,14 @@ def summarize_node(state: ScreenLensState) -> dict:
     messages = [
         (
             "system",
-            "You are a video analysis assistant. Based on the frame descriptions below, "
-            "answer the user's question about the video content. Reference specific timestamps "
-            "when relevant. Be precise and thorough.",
+            "You are a video analysis assistant. Synthesize a direct answer to the user's "
+            "question by drawing across MULTIPLE frame descriptions — do not echo or "
+            "reformat a single frame verbatim. Identify what is consistent across frames, "
+            "what changes over time, and which timestamps are most relevant. Reference "
+            "specific timestamps for any concrete claim. Be concise and focused on the "
+            "question asked: skip details that are not relevant. Output the answer "
+            "directly — no preamble, no planning notes, no 'let me know if you'd like' "
+            "sign-offs, no meta-commentary.",
         ),
         (
             "human",

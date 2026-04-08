@@ -58,7 +58,7 @@ stateDiagram-v2
 | Component | Technology | Purpose |
 |-----------|-----------|---------|
 | Frame Extraction | **Hybrid keyframe detection** (SSIM + pHash + HSV) | Only captures distinct screens — skips duplicates |
-| Vision Captioning | **Qwen3.5-VL** via mlx-vlm (Apple Silicon native) | Dense, high-fidelity frame descriptions |
+| Vision Captioning | **Qwen3.5-VL** via mlx-vlm (Apple Silicon native) | Dense, high-fidelity frame descriptions, batched via `mlx_vlm.batch_generate` (default 4 frames/call) |
 | Fallback Captioning | Ollama (llama3.2-vision) | Cross-platform alternative |
 | Visual Embeddings | OpenCLIP ViT-B-32 | Semantic vector representations |
 | Vector Storage | ChromaDB | Persistent similarity search |
@@ -109,6 +109,14 @@ python -m src.cli ingest "video.mov" --backend ollama --strategy fixed_fps --fps
 ```bash
 python -m src.cli ingest "video.mov" --mlx-repo mlx-community/Qwen3.5-35B-A3B-4bit
 ```
+
+Captioning runs in batches of 4 frames per `mlx_vlm.batch_generate` call by default. To override:
+
+```bash
+python -m src.cli ingest "video.mov" --batch-size 8
+```
+
+The default of 4 was empirically tuned on M3 Ultra 512GB with the 122B model — see the [Performance Notes](#performance-notes) section. If you switch to a smaller model, re-run `scripts/bench_caption_batch.py` to find the new optimum.
 
 ### 4. Batch-Ingest a Folder of Videos
 
@@ -174,10 +182,20 @@ All settings live in `src/config.py` (Pydantic models). Key parameters:
 | `frame_extraction.strategy` | keyframe | `keyframe` (smart) or `fixed_fps` |
 | `frame_extraction.max_interval_seconds` | 4.0 | Max gap between keyframes |
 | `captioning.backend` | mlx_vlm | `mlx_vlm` (Qwen3.5) or `ollama` |
-| `captioning.mlx_repo_id` | Qwen3.5-35B-A3B-4bit | HuggingFace MLX model |
+| `captioning.mlx_repo_id` | Qwen3.5-122B-A10B-bf16 | HuggingFace MLX model (override with `--mlx-repo`) |
+| `captioning.batch_size` | 4 | Frames per `mlx_vlm.batch_generate` call (MLX backend only) |
+| `captioning.max_tokens` | 1024 | Max tokens per caption |
 | `embedding.model_name` | ViT-B-32 | CLIP model |
 | `embedding.device` | mps | Apple Silicon GPU |
 | `search.top_k` | 10 | Results per query |
+
+## Performance Notes
+
+Captioning is parallelized via `mlx_vlm.batch_generate`, which packs multiple frames into a single forward pass with a shared KV cache and zero-padding within same-shape image groups. The default `batch_size=4` was empirically tuned on M3 Ultra 512GB with `Qwen3.5-122B-A10B-bf16`: it gives a real ~1.5× aggregate throughput improvement over `batch_size=1`, while `batch_size=8` regresses (likely MoE expert dispersion at higher batch sizes). Memory was not the constraint — peak GPU usage stayed under 270 GB out of 512 GB at every tested batch size.
+
+On Apple Silicon with large vision inputs, **prefill (vision encoder + prompt) dominates per-frame time, not decode**. This means that the main lever for further wall-clock improvement is *not* a larger batch size — it's a smaller model (e.g. `Qwen3.5-35B-A3B-4bit`) or a smaller `frame_extraction.max_dimension`. Re-run `scripts/bench_caption_batch.py` whenever you change the model to find the new optimum.
+
+The captioner installs a module-level monkey-patch on `mlx_vlm.generate.apply_chat_template` to inject `enable_thinking=False`. This is required because Qwen3.5-VL's chat template prepends `<think>` to the assistant turn, and `mlx_vlm.batch_generate` does not forward kwargs to `apply_chat_template`, so without the patch ~50% of every caption's token budget gets burned on planning prose before the structured response. The patch is idempotent and a no-op for non-Qwen models.
 
 ## Project Structure
 
@@ -185,11 +203,14 @@ All settings live in `src/config.py` (Pydantic models). Key parameters:
 src/
   config.py          # Pydantic configuration (extraction, captioning, embedding, search)
   frame_extractor.py # Hybrid keyframe detection + fixed FPS fallback
-  captioner.py       # Dual backend: mlx-vlm (Qwen3.5) + Ollama
+  captioner.py       # Dual backend: mlx-vlm (Qwen3.5) + Ollama; batched via batch_generate
   embedder.py        # CLIP embedding via OpenCLIP
   vector_store.py    # ChromaDB storage + search
-  pipeline.py        # LangGraph StateGraph orchestration
+  pipeline.py        # LangGraph StateGraph orchestration (ingest/search/summarize)
+  reconstruct.py     # LangGraph deep agents — artifact reconstruction with QA reflection
   cli.py             # Typer CLI interface
+scripts/
+  bench_caption_batch.py  # MLX-VLM batch-size sweep + frames/sec & peak-memory plot
 data/
   frames/            # Extracted keyframe images
   captions/          # JSON caption files
