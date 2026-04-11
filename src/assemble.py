@@ -27,14 +27,12 @@ from __future__ import annotations
 
 import json
 import logging
-import operator
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Optional, TypedDict
+from typing import Optional, TypedDict
 
 from langgraph.graph import StateGraph, START, END
-from langgraph.types import Send
 
 from .config import ScreenLensConfig
 from .reconstruct import get_mlx_model, mlx_generate, parse_json_response
@@ -92,6 +90,48 @@ CLASSIFY_CORPUS_SYSTEM = (
 )
 
 
+INFER_PATHS_SYSTEM = (
+    "You are inferring the original source-tree paths for reconstructed "
+    "video-recording artifacts in a coding project. Each input record gives "
+    "you:\n"
+    "  - folder: the recording slug, often encoding the original path\n"
+    "  - description: a one-line summary of what the file contains\n"
+    "  - snippet: the first ~400 chars of the reconstructed file\n\n"
+    "Use ALL THREE signals — slug structure, description, and content snippet — "
+    "to infer the most likely original path relative to the project root.\n\n"
+    "CONTEXT (hint, not a hard constraint): the corpus may have these top-level "
+    "directories: {roots}. You MAY also propose paths under directories not in "
+    "this list if the slug + content clearly indicate them — the classifier is "
+    "best-effort and may have missed sub-roots.\n\n"
+    "Heuristics:\n"
+    "1. Underscores between known directory tokens (src, tests, seed, services, "
+    "domain, orchestration, scripts, api, docs, database) are usually path "
+    "separators. So 'src_services_main.py' → 'src/services/main.py'.\n"
+    "2. 'dot.X' → '.X' (hidden file). e.g. 'dot.env' → '.env'.\n"
+    '3. "stanadalone_" / "src_servies_" are common typos — treat as standalone_/'
+    "src_services_ respectively.\n"
+    '4. "standalone_*" files are part of a "standalone_graph_api" package — likely '
+    'path "asr-graph-compliance-api/src/standalone_graph_api/<basename>". Verify '
+    "with content (imports, docstrings).\n"
+    "5. When the slug is generic (document.md, app.py, tree), use the snippet's "
+    "imports / headers / first lines to decide where it belongs.\n"
+    "6. If the file content has a 'File: ...' header docstring, TRUST it.\n"
+    "7. Two artifacts must NOT map to the same destination path. If two slugs "
+    "look like they want the same path, distinguish them by content (e.g. one is "
+    "'__main__.py' if it imports .main, the other is 'main.py').\n"
+    "8. Be decisive. Mark confidence 'low' if you're guessing, but still pick a "
+    "path.\n\n"
+    "Respond with ONLY a valid JSON ARRAY (no markdown fences). One object per "
+    "input record, in the SAME ORDER as the input:\n"
+    "[\n"
+    '  {"folder": "<from input>", "src_rel": "<from input>", '
+    '"dst_rel": "<your inferred path>", "confidence": "high|medium|low", '
+    '"reasoning": "<one short sentence>"},\n'
+    "  ...\n"
+    "]"
+)
+
+
 # ── State ────────────────────────────────────────────────────────────────────
 
 class AssembleState(TypedDict, total=False):
@@ -115,9 +155,11 @@ class AssembleState(TypedDict, total=False):
     roots_confidence: float
     roots_reasoning: str
 
-    # Path inference (filled by sub-agents — uses reducer)
+    # Path inference (single sequential node — no reducer needed because there
+    # is only one writer; parallel Send fan-out segfaults on the cached MLX
+    # model, same constraint as reconstruct.reconstruct_sequential).
     inference_batches: list[list[dict]]
-    path_mappings: Annotated[list[dict], operator.add]
+    path_mappings: list[dict]
 
     # Cluster
     clusters: dict
@@ -340,22 +382,200 @@ def classify_corpus_node(state: AssembleState) -> dict:
     }
 
 
-# ── Stub nodes (filled in step 3+) ───────────────────────────────────────────
-
 def plan_paths_node(state: AssembleState) -> dict:
-    """STUB — implemented in step 3."""
-    print(f"\n  [stub] plan_paths_node — not implemented yet")
-    return {"inference_batches": [], "stage": "planned"}
+    """Partition the artifact list into batches for inference workers.
+
+    Each batch becomes one ``Send`` payload dispatched to ``infer_paths_worker``.
+    On retry (qa_iteration > 0), the qa_feedback is attached to each batch so
+    workers can incorporate it.
+    """
+    t0 = time.time()
+    artifacts = state["artifacts"]
+    qa_iteration = state.get("qa_iteration", 0)
+    qa_feedback = state.get("qa_feedback", "")
+
+    print(f"\n{'='*60}")
+    print(f"[4/8] PLAN PATHS — PARTITION INTO INFERENCE BATCHES")
+    if qa_iteration > 0:
+        print(f"      Retry #{qa_iteration} — incorporating QA feedback")
+    print(f"{'='*60}")
+
+    batches = []
+    for i in range(0, len(artifacts), INFERENCE_BATCH_SIZE):
+        batches.append(artifacts[i:i + INFERENCE_BATCH_SIZE])
+
+    elapsed = time.time() - t0
+    print(f"  {len(artifacts)} artifact(s) → {len(batches)} batch(es) of "
+          f"≤{INFERENCE_BATCH_SIZE}")
+    print(f"  Planned in {elapsed:.1f}s")
+
+    return {
+        "inference_batches": batches,
+        "stage": "planned",
+        "elapsed_seconds": {**state.get("elapsed_seconds", {}), "plan": round(elapsed, 2)},
+    }
 
 
-def infer_paths_worker(state: dict) -> dict:
-    """STUB — implemented in step 3."""
-    return {"path_mappings": []}
+def _parse_inference_response(parsed, batch: list[dict]) -> list[dict]:
+    """Normalize an LLM inference response into a clean list of mapping dicts."""
+    if isinstance(parsed, list):
+        raw = parsed
+    elif isinstance(parsed, dict):
+        raw = parsed.get("mappings") or parsed.get("results") or []
+    else:
+        raw = []
+
+    cleaned: list[dict] = []
+    for i, m in enumerate(raw):
+        if not isinstance(m, dict):
+            continue
+        # Backfill folder/src_rel from input order if the model omits them
+        if i < len(batch):
+            m.setdefault("folder", batch[i]["folder"])
+            m.setdefault("src_rel", batch[i]["src_rel"])
+        if "dst_rel" not in m:
+            continue
+        cleaned.append({
+            "folder": m["folder"],
+            "src_rel": m["src_rel"],
+            "dst_rel": m["dst_rel"],
+            "confidence": m.get("confidence", "low"),
+            "reasoning": m.get("reasoning", ""),
+        })
+    return cleaned
+
+
+def infer_paths_sequential(state: AssembleState) -> dict:
+    """Loop over inference batches sequentially, one LLM call per batch.
+
+    Sequential because MLX inference is not reentrant on the cached model
+    (same constraint as reconstruct.reconstruct_sequential at line 779).
+    The whole loop runs inside this single graph node so the path_mappings
+    list is built in-process and returned as a single state update — no
+    reducer needed.
+    """
+    t0 = time.time()
+    config = ScreenLensConfig(**state["config"])
+    batches: list[list[dict]] = state.get("inference_batches", [])
+    project_roots: list[str] = state.get("project_roots", [])
+    qa_feedback: str = state.get("qa_feedback", "")
+
+    model, tokenizer = get_mlx_model(config)
+
+    print(f"\n{'='*60}")
+    print(f"[5/8] INFER PATHS — SEQUENTIAL ({len(batches)} batch(es))")
+    print(f"{'='*60}")
+
+    roots_display = ", ".join(repr(r) for r in project_roots) if project_roots else "(none detected)"
+    # Use .replace() rather than .format() — the prompt template contains
+    # literal JSON examples with braces that would otherwise be interpreted
+    # as format placeholders.
+    system_prompt = INFER_PATHS_SYSTEM.replace("{roots}", roots_display)
+
+    all_mappings: list[dict] = []
+
+    for batch_index, batch in enumerate(batches, 1):
+        bt0 = time.time()
+        print(f"\n  [Batch {batch_index}/{len(batches)}] Inferring paths for "
+              f"{len(batch)} artifact(s)...")
+
+        records_text = []
+        for a in batch:
+            snippet = a.get("snippet", "")[:SNIPPET_CHARS]
+            records_text.append(
+                f"---\n"
+                f"folder: {a['folder']}\n"
+                f"src_rel: {a['src_rel']}\n"
+                f"description: {(a.get('description') or '').strip()}\n"
+                f"snippet:\n{snippet}\n"
+            )
+
+        user_prompt = (
+            f"Infer the original source-tree paths for the following "
+            f"{len(batch)} artifact(s):\n\n"
+            + "\n".join(records_text)
+        )
+        if qa_feedback:
+            user_prompt += (
+                f"\n\nPREVIOUS QA FEEDBACK (incorporate this in your decisions):\n"
+                f"{qa_feedback}\n"
+            )
+
+        response = mlx_generate(
+            model, tokenizer, system_prompt, user_prompt,
+            max_tokens=2048, temperature=0.1,
+        )
+        parsed = parse_json_response(response)
+        cleaned = _parse_inference_response(parsed, batch)
+        all_mappings.extend(cleaned)
+
+        bt = time.time() - bt0
+        print(f"  [Batch {batch_index}/{len(batches)}] {len(cleaned)} mapping(s) "
+              f"in {bt:.1f}s")
+        if len(cleaned) < len(batch):
+            missing = len(batch) - len(cleaned)
+            print(f"  [Batch {batch_index}/{len(batches)}] WARNING: {missing} "
+                  f"artifact(s) returned no usable mapping")
+
+    elapsed = time.time() - t0
+    print(f"\n  Total: {len(all_mappings)} mapping(s) across {len(batches)} batch(es) "
+          f"in {elapsed:.1f}s")
+
+    return {
+        "path_mappings": all_mappings,
+        "stage": "inferred",
+        "elapsed_seconds": {**state.get("elapsed_seconds", {}), "infer": round(elapsed, 2)},
+    }
 
 
 def cluster_node(state: AssembleState) -> dict:
-    """STUB — implemented in step 3."""
-    return {"clusters": {}, "collisions": [], "stage": "clustered"}
+    """Group inferred mappings by their top-level directory and detect collisions."""
+    t0 = time.time()
+    mappings = state.get("path_mappings", [])
+
+    print(f"\n{'='*60}")
+    print(f"[6/8] CLUSTER — GROUP BY ROOT, DETECT COLLISIONS")
+    print(f"      Reviewing {len(mappings)} mapping(s)")
+    print(f"{'='*60}")
+
+    clusters: dict[str, list[dict]] = {}
+    for m in mappings:
+        dst = m["dst_rel"].lstrip("/")
+        # First path segment is the cluster key. Files at root (e.g. ".env",
+        # "pyproject.toml") cluster under "" — printed as "(root)".
+        head, _, _ = dst.partition("/")
+        if "/" not in dst:
+            head = ""
+        clusters.setdefault(head, []).append(m)
+
+    seen_dst: dict[str, list[str]] = {}
+    for m in mappings:
+        seen_dst.setdefault(m["dst_rel"], []).append(m["folder"])
+    collisions = [path for path, folders in seen_dst.items() if len(folders) > 1]
+
+    elapsed = time.time() - t0
+    print(f"\n  Clusters detected: {len(clusters)}")
+    for root in sorted(clusters.keys()):
+        display = "(root)" if root == "" else root
+        print(f"    - {display}: {len(clusters[root])} file(s)")
+    if collisions:
+        print(f"\n  COLLISIONS ({len(collisions)}):")
+        for c in collisions:
+            print(f"    - {c}  ← {seen_dst[c]}")
+    else:
+        print(f"  No collisions ✓")
+
+    print(f"  Clustered in {elapsed:.1f}s")
+
+    return {
+        "clusters": clusters,
+        "collisions": collisions,
+        "stage": "clustered",
+        "elapsed_seconds": {**state.get("elapsed_seconds", {}), "cluster": round(elapsed, 2)},
+    }
+
+
+# ── Stub nodes (filled in step 4+) ───────────────────────────────────────────
 
 
 def qa_reflect_node(state: AssembleState) -> dict:
@@ -384,18 +604,48 @@ def route_after_gate(state: AssembleState) -> str:
     return "classify_corpus" if state.get("is_code_project") else "end_with_explanation"
 
 
-def route_after_classify(state: AssembleState) -> str:
-    """In dry-run, stop after classification. Otherwise continue to planning."""
-    return "end_dry_run" if state.get("dry_run") else "plan_paths"
+def route_after_cluster(state: AssembleState) -> str:
+    """In --dry-run, terminate after clustering (everything LLM-driven is done).
+    Otherwise continue to QA reflection."""
+    return "end_dry_run" if state.get("dry_run") else "qa_reflect"
 
 
 def end_dry_run_node(state: AssembleState) -> dict:
-    """Terminal node for --dry-run mode after the corpus-classification phase."""
+    """Terminal node for --dry-run mode. Prints summary and dumps the full
+    mapping JSON to ./data/.assemble_dry_run.json for inspection."""
     print(f"\n{'='*60}")
-    print(f"DRY RUN — stopping after corpus classification")
+    print(f"DRY RUN — stopping before QA / materialize")
     print(f"{'='*60}")
-    print(f"  Project: {'YES' if state.get('is_code_project') else 'NO'}")
-    print(f"  Roots:   {state.get('project_roots', [])}")
+    mappings = state.get("path_mappings", [])
+    clusters = state.get("clusters", {})
+    collisions = state.get("collisions", [])
+
+    conf_counts = {"high": 0, "medium": 0, "low": 0}
+    for m in mappings:
+        c = m.get("confidence", "low")
+        conf_counts[c] = conf_counts.get(c, 0) + 1
+    print(f"  Mappings produced: {len(mappings)}")
+    print(f"  Confidence:        high={conf_counts['high']} medium={conf_counts['medium']} low={conf_counts['low']}")
+    print(f"  Clusters:          {len(clusters)}")
+    print(f"  Collisions:        {len(collisions)}")
+
+    flagged = [m for m in mappings if m.get("confidence") != "high"]
+    if flagged:
+        print(f"\n  Non-high-confidence mappings ({len(flagged)}) — review:")
+        for m in flagged:
+            print(f"    [{m['confidence']:>6}] {m['folder'][:50]:<52} → {m['dst_rel']}")
+            if m.get("reasoning"):
+                print(f"             {m['reasoning'][:120]}")
+
+    # Dump the full mapping to a sidecar file for inspection / diffing.
+    # data/ is gitignored, so this won't pollute commits.
+    dump_path = Path(state.get("data_dir", "./data")) / ".assemble_dry_run.json"
+    try:
+        dump_path.write_text(json.dumps(mappings, indent=2))
+        print(f"\n  Full mapping dumped to: {dump_path}")
+    except Exception as e:
+        print(f"\n  Could not dump mapping: {e}")
+
     return {"stage": "dry_run_complete"}
 
 
@@ -417,7 +667,7 @@ def build_assemble_graph():
     graph.add_node("end_with_explanation", end_with_explanation_node)
     graph.add_node("end_dry_run", end_dry_run_node)
     graph.add_node("plan_paths", plan_paths_node)
-    graph.add_node("infer_paths_worker", infer_paths_worker)
+    graph.add_node("infer_paths_sequential", infer_paths_sequential)
     graph.add_node("cluster", cluster_node)
     graph.add_node("qa_reflect", qa_reflect_node)
     graph.add_node("materialize", materialize_node)
@@ -428,17 +678,17 @@ def build_assemble_graph():
         "gate", route_after_gate,
         {"classify_corpus": "classify_corpus", "end_with_explanation": "end_with_explanation"},
     )
+    graph.add_edge("classify_corpus", "plan_paths")
+    graph.add_edge("plan_paths", "infer_paths_sequential")
+    graph.add_edge("infer_paths_sequential", "cluster")
     graph.add_conditional_edges(
-        "classify_corpus", route_after_classify,
-        {"end_dry_run": "end_dry_run", "plan_paths": "plan_paths"},
+        "cluster", route_after_cluster,
+        {"end_dry_run": "end_dry_run", "qa_reflect": "qa_reflect"},
     )
     graph.add_edge("end_with_explanation", END)
     graph.add_edge("end_dry_run", END)
 
-    # Stub edges — wired so the graph is structurally complete; nodes are no-ops
-    graph.add_edge("plan_paths", "infer_paths_worker")
-    graph.add_edge("infer_paths_worker", "cluster")
-    graph.add_edge("cluster", "qa_reflect")
+    # Stub edges — qa_reflect → materialize → END will become real in steps 4–5
     graph.add_edge("qa_reflect", "materialize")
     graph.add_edge("materialize", END)
 
