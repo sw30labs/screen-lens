@@ -82,7 +82,7 @@ Key mechanics worth knowing before editing:
 - **Reducer for collecting sub-agent outputs.** `artifacts: Annotated[list[dict], operator.add]` lets multiple `Send`-dispatched workers append their results without clobbering each other. Each artifact carries an `iteration` field so `qa_reflect_node` and `save_node` can distinguish current-iteration outputs from prior-iteration ones.
 - **Model cache.** `_MODEL_CACHE` (module-level dict, keyed by `mlx_repo_id`) ensures the MLX model is loaded once across all nodes — critical because Qwen3.5-122B takes a while to load. Both pipelines share this pattern: load once, reuse.
 - **Reflection feedback loop.** When `qa_reflect_node` fails, it stores `qa_feedback` and increments `qa_iteration`; the next pass through `plan_node` injects `PREVIOUS QA FEEDBACK` into each task prompt. After `MAX_QA_ITERATIONS - 1`, QA force-passes to avoid infinite loops.
-- **JSON parsing.** LLM JSON responses are parsed via `_parse_json_response`, which tries direct → fenced → first `{...}` block. Always use this helper rather than `json.loads` directly on model output.
+- **JSON parsing.** LLM JSON responses are parsed via `parse_json_response`, which tries direct → fenced → first `{...}` block. Always use this helper rather than `json.loads` directly on model output.
 
 ### Configuration (`src/config.py`)
 
@@ -110,7 +110,7 @@ The single-video commands (`ingest`, `search`) default to the top-level `./data/
 ## Things to Watch For
 
 - **Qwen3.5 thinking suppression** uses `enable_thinking=False` in `apply_chat_template`. Do **not** revert to the Qwen3-era `/no_think` slash command. Both pipelines also strip `<think>...</think>` defensively after generation.
-- **mlx-vlm `generate` return type** varies: it can return a `str` or an object with `.text`. Always handle both — see `_mlx_text_generate` in `pipeline.py` and `_mlx_generate` in `reconstruct.py`.
+- **mlx-vlm `generate` return type** varies: it can return a `str` or an object with `.text`. Always handle both — see `_mlx_text_generate` in `pipeline.py` and `mlx_generate` in `reconstruct.py`.
 - **CLIP device** defaults to `mps`. Tests pin it to `cpu` (`TestEmbedder` fixture) so they run anywhere. If you add embedder tests, do the same.
 - **`data/` is gitignored** along with `*.mov`/`*.mp4` and other video formats — don't try to commit fixtures.
 - **`model.config` introspection** in `summarize_all_node` walks several attribute names (`max_position_embeddings`, `max_seq_len`, etc., plus nested `text_config`) because different VLM architectures expose context size differently. Preserve this fallback chain when touching that code.

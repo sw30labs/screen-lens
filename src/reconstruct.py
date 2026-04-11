@@ -241,7 +241,7 @@ class ReconstructState(TypedDict, total=False):
 _MODEL_CACHE: dict = {}
 
 
-def _get_mlx_model(config: ScreenLensConfig):
+def get_mlx_model(config: ScreenLensConfig):
     """Load MLX model once and cache for reuse across all nodes."""
     key = config.captioning.mlx_repo_id
     if key not in _MODEL_CACHE:
@@ -255,7 +255,7 @@ def _get_mlx_model(config: ScreenLensConfig):
     return _MODEL_CACHE[key]
 
 
-def _mlx_generate(model, tokenizer, system: str, user: str,
+def mlx_generate(model, tokenizer, system: str, user: str,
                    max_tokens: int = 4096, temperature: float = 0.2) -> str:
     """Generate text using the MLX model (text-only, no image)."""
     from mlx_vlm import generate
@@ -282,7 +282,7 @@ def _mlx_generate(model, tokenizer, system: str, user: str,
     return re.sub(r'<think>.*?</think>\s*', '', raw, flags=re.DOTALL).strip()
 
 
-def _parse_json_response(text: str) -> dict:
+def parse_json_response(text: str) -> dict:
     """Extract JSON from LLM response, handling markdown fences and extra text."""
     # Try direct parse first
     try:
@@ -418,7 +418,7 @@ def _extract_segment_notes(
             f"Frame captions covering the entire recording "
             f"({len(captions)} frames):\n\n{all_block}"
         )
-        notes = _mlx_generate(
+        notes = mlx_generate(
             model, tokenizer, EXTRACT_SEGMENT_SYSTEM, user,
             max_tokens=4096, temperature=0.1,
         )
@@ -443,7 +443,7 @@ def _extract_segment_notes(
             f"SEGMENT CAPTIONS:\n\n{chunk_block}"
         )
         t0 = time.time()
-        notes = _mlx_generate(
+        notes = mlx_generate(
             model, tokenizer, EXTRACT_SEGMENT_SYSTEM, user,
             max_tokens=2048, temperature=0.1,
         )
@@ -494,7 +494,7 @@ def _hierarchical_synthesize(
             f"across all segments to produce the final artifact.\n\n"
             f"SEGMENT NOTES:\n\n{notes_block}"
         )
-        return _mlx_generate(
+        return mlx_generate(
             model, tokenizer, task_system_prompt, user,
             max_tokens=max_output_tokens, temperature=0.1,
         )
@@ -527,7 +527,7 @@ def _hierarchical_synthesize(
             f"SECTION NOTES:\n\n{group_block}"
         )
         t0 = time.time()
-        result = _mlx_generate(
+        result = mlx_generate(
             model, tokenizer, EXTRACT_SEGMENT_SYSTEM, intermediate_user,
             max_tokens=2048, temperature=0.1,
         )
@@ -550,7 +550,7 @@ def classify_node(state: ReconstructState) -> dict:
     """Classify the content type from captions."""
     t0 = time.time()
     config = ScreenLensConfig(**state["config"])
-    model, tokenizer = _get_mlx_model(config)
+    model, tokenizer = get_mlx_model(config)
     captions = state["captions"]
 
     print(f"\n{'='*60}")
@@ -571,9 +571,9 @@ def classify_node(state: ReconstructState) -> dict:
         + "\n\n---\n\n".join(caption_texts)
     )
 
-    response = _mlx_generate(model, tokenizer, CLASSIFY_SYSTEM, user_prompt,
+    response = mlx_generate(model, tokenizer, CLASSIFY_SYSTEM, user_prompt,
                               max_tokens=512, temperature=0.1)
-    result = _parse_json_response(response)
+    result = parse_json_response(response)
 
     content_type = result.get("type", "gui_demo")
     if content_type not in CONTENT_TYPES:
@@ -600,7 +600,7 @@ def plan_node(state: ReconstructState) -> dict:
     """Generate reconstruction plan: system prompt, task list, parallelism decision."""
     t0 = time.time()
     config = ScreenLensConfig(**state["config"])
-    model, tokenizer = _get_mlx_model(config)
+    model, tokenizer = get_mlx_model(config)
     content_type = state["content_type"]
     captions = state["captions"]
     qa_feedback = state.get("qa_feedback", "")
@@ -624,9 +624,9 @@ def plan_node(state: ReconstructState) -> dict:
         sampled = _stratified_sample(captions, 60)
         sample_block = _build_caption_block(sampled, max_chars=80000)
         file_id_prompt = f"Frame captions from a Python coding session:\n\n{sample_block}"
-        response = _mlx_generate(model, tokenizer, PLAN_PYTHON_SYSTEM,
+        response = mlx_generate(model, tokenizer, PLAN_PYTHON_SYSTEM,
                                   file_id_prompt, max_tokens=1024, temperature=0.1)
-        plan = _parse_json_response(response)
+        plan = parse_json_response(response)
 
         files = plan.get("files", [{"filename": "reconstructed.py",
                                      "description": "Main script"}])
@@ -728,7 +728,7 @@ def reconstruct_worker(state: dict) -> dict:
     """
     task = state["task"]
     config = ScreenLensConfig(**state["config"])
-    model, tokenizer = _get_mlx_model(config)
+    model, tokenizer = get_mlx_model(config)
     captions = state.get("captions", [])
     segment_notes = state.get("segment_notes") or []
     model_context = _get_model_context_size(model)
@@ -776,7 +776,7 @@ def reconstruct_sequential(state: ReconstructState) -> dict:
                any QA feedback embedded in the task user prompt.
     """
     config = ScreenLensConfig(**state["config"])
-    model, tokenizer = _get_mlx_model(config)
+    model, tokenizer = get_mlx_model(config)
     captions = state["captions"]
     tasks = state["reconstruction_tasks"]
     system_prompt = state.get("system_prompt", "")
@@ -838,7 +838,7 @@ def qa_reflect_node(state: ReconstructState) -> dict:
     """Quality-check artifacts using a reflection agent. Routes to retry or save."""
     t0 = time.time()
     config = ScreenLensConfig(**state["config"])
-    model, tokenizer = _get_mlx_model(config)
+    model, tokenizer = get_mlx_model(config)
     qa_iteration = state.get("qa_iteration", 0)
     captions = state["captions"]
 
@@ -886,9 +886,9 @@ def qa_reflect_node(state: ReconstructState) -> dict:
         f"RECONSTRUCTED ARTIFACTS:\n{artifacts_text}"
     )
 
-    response = _mlx_generate(model, tokenizer, QA_REFLECT_SYSTEM, user_prompt,
+    response = mlx_generate(model, tokenizer, QA_REFLECT_SYSTEM, user_prompt,
                               max_tokens=1024, temperature=0.1)
-    result = _parse_json_response(response)
+    result = parse_json_response(response)
 
     passed = result.get("passed", True)
     overall = result.get("overall", 7.0)
