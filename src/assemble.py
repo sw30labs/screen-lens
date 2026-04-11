@@ -868,10 +868,140 @@ def qa_reflect_node(state: AssembleState) -> dict:
     }
 
 
+def _build_assembly_report(state: AssembleState, timestamp: str) -> str:
+    """Build the human-readable ASSEMBLY_REPORT.md content."""
+    mappings = state.get("path_mappings", [])
+    clusters = state.get("clusters", {})
+    findings = state.get("qa_findings", {})
+    qa_iters = state.get("qa_iteration", 0)
+
+    conf_counts = {"high": 0, "medium": 0, "low": 0}
+    for m in mappings:
+        conf_counts[m.get("confidence", "low")] = conf_counts.get(m.get("confidence", "low"), 0) + 1
+
+    lines: list[str] = []
+    lines.append(f"# Assembly Report — {timestamp}\n")
+    lines.append(f"- **Source**: `{state.get('data_dir')}`")
+    lines.append(f"- **Output**: `OUTPUT/{timestamp}/`")
+    lines.append(f"- **Total artifacts assembled**: {len(mappings)}")
+    lines.append(f"- **Confidence distribution**: high={conf_counts['high']}, "
+                 f"medium={conf_counts['medium']}, low={conf_counts['low']}")
+    lines.append(f"- **QA iterations used**: {qa_iters}")
+    lines.append(f"- **QA passed**: {state.get('qa_passed', False)}")
+    lines.append("")
+
+    lines.append("## Cluster summary\n")
+    for root in sorted(clusters.keys()):
+        display = "(root)" if root == "" else root
+        lines.append(f"- **{display}**: {len(clusters[root])} file(s)")
+    lines.append("")
+
+    if findings:
+        lines.append("## QA findings\n")
+        lines.append(f"- Unresolved imports: {len(findings.get('unresolved_imports', []))}")
+        lines.append(f"- Orphans: {len(findings.get('orphans', []))} "
+                     f"(note: relative imports are not analyzed, so this number "
+                     f"is inflated by services that only import each other relatively)")
+        if findings.get("unresolved_imports"):
+            lines.append("\n### Sample unresolved imports\n")
+            for f, mod in findings["unresolved_imports"][:10]:
+                lines.append(f"- `{f}` → `{mod}`")
+        lines.append("")
+
+    flagged = [m for m in mappings if m.get("confidence") != "high"]
+    if flagged:
+        lines.append("## Mappings to review (non-high confidence)\n")
+        for m in flagged:
+            lines.append(f"- **{m['confidence']}** — `{m['folder']}` → `{m['dst_rel']}`")
+            if m.get("reasoning"):
+                lines.append(f"  - {m['reasoning']}")
+        lines.append("")
+
+    lines.append("## Full mapping\n")
+    lines.append("See `MANIFEST.json` for the complete source-folder → "
+                 "destination-path mapping. The MANIFEST is structurally "
+                 "identical to a `ratita_mapping.json` and can be hand-edited "
+                 "and re-applied via `python -m src.cli assemble --mapping <path>`.")
+
+    return "\n".join(lines) + "\n"
+
+
 def materialize_node(state: AssembleState) -> dict:
-    """STUB — implemented in step 5. In dry-run, never reached."""
-    print(f"\n  [stub] materialize_node — not implemented yet")
-    return {"materialized_files": [], "stage": "materialized"}
+    """Write the assembled tree to OUTPUT/<timestamp>/.
+
+    Always creates parent directories before write_text (the lesson from
+    reconstruct.save_node — nested dst_rel paths like
+    'asr-graph-compliance-api/src/standalone_graph_api/models.py' need
+    intermediate dirs created or write_text crashes).
+    """
+    t0 = time.time()
+    output_root = Path(state["output_dir"])
+    timestamp = state.get("timestamp") or datetime.now().strftime("%Y%m%d_%H%M%S")
+    target_dir = output_root / timestamp
+
+    mappings = state.get("path_mappings", [])
+    artifacts = state.get("artifacts", [])
+    artifacts_by_key = {(a["folder"], a["src_rel"]): a for a in artifacts}
+
+    print(f"\n{'='*60}")
+    print(f"[8/8] MATERIALIZE — WRITE ASSEMBLED TREE")
+    print(f"      Target: {target_dir}")
+    print(f"      Files:  {len(mappings)}")
+    print(f"{'='*60}")
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    written: list[str] = []
+    skipped_missing: list[str] = []
+    skipped_collision: list[str] = []
+    seen_dst: set[str] = set()
+    import shutil
+
+    for m in mappings:
+        key = (m["folder"], m["src_rel"])
+        artifact = artifacts_by_key.get(key)
+        if not artifact:
+            skipped_missing.append(f"{m['folder']}/{m['src_rel']}")
+            continue
+        src_abs = Path(artifact["src_abs"])
+        if not src_abs.is_file():
+            skipped_missing.append(str(src_abs))
+            continue
+        dst_rel = m["dst_rel"].lstrip("/")
+        if dst_rel in seen_dst:
+            # Last writer wins, but log it
+            skipped_collision.append(dst_rel)
+        seen_dst.add(dst_rel)
+        dst_abs = target_dir / dst_rel
+        dst_abs.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_abs, dst_abs)
+        written.append(str(dst_abs))
+
+    # MANIFEST.json — full mapping in the same shape as ratita_mapping.json,
+    # so it can be hand-edited and re-applied via --mapping.
+    manifest_path = target_dir / "MANIFEST.json"
+    manifest_path.write_text(json.dumps(mappings, indent=2))
+
+    # ASSEMBLY_REPORT.md — human-readable summary.
+    report_path = target_dir / "ASSEMBLY_REPORT.md"
+    report_path.write_text(_build_assembly_report(state, timestamp))
+
+    elapsed = time.time() - t0
+    print(f"\n  Wrote {len(written)} file(s) in {elapsed:.1f}s")
+    if skipped_missing:
+        print(f"  Skipped (missing source): {len(skipped_missing)}")
+    if skipped_collision:
+        print(f"  Collisions (last writer won): {len(skipped_collision)}")
+        for c in skipped_collision[:5]:
+            print(f"    - {c}")
+    print(f"  MANIFEST: {manifest_path}")
+    print(f"  REPORT:   {report_path}")
+
+    return {
+        "materialized_files": written,
+        "stage": "materialized",
+        "elapsed_seconds": {**state.get("elapsed_seconds", {}), "materialize": round(elapsed, 2)},
+    }
 
 
 def end_with_explanation_node(state: AssembleState) -> dict:
@@ -883,17 +1013,84 @@ def end_with_explanation_node(state: AssembleState) -> dict:
     return {"stage": "gate_failed"}
 
 
+def load_override_mapping_node(state: AssembleState) -> dict:
+    """Load a hand-edited MANIFEST.json from --mapping and skip LLM inference.
+
+    Sets path_mappings directly. Cluster + QA still run on the loaded mapping
+    so the user gets validation feedback even on a manually-curated mapping.
+    """
+    t0 = time.time()
+    mapping_path = state.get("mapping_override")
+    print(f"\n{'='*60}")
+    print(f"[BYPASS] LOADING MAPPING OVERRIDE")
+    print(f"      Source: {mapping_path}")
+    print(f"{'='*60}")
+
+    if not mapping_path or not Path(mapping_path).is_file():
+        print(f"  ERROR: mapping file not found: {mapping_path}")
+        return {"path_mappings": [], "stage": "override_failed",
+                "elapsed_seconds": {**state.get("elapsed_seconds", {}), "override": 0.0}}
+
+    try:
+        loaded = json.loads(Path(mapping_path).read_text())
+    except Exception as e:
+        print(f"  ERROR: failed to parse mapping JSON: {e}")
+        return {"path_mappings": [], "stage": "override_failed"}
+
+    if not isinstance(loaded, list):
+        print(f"  ERROR: mapping must be a JSON array, got {type(loaded).__name__}")
+        return {"path_mappings": [], "stage": "override_failed"}
+
+    cleaned = []
+    for entry in loaded:
+        if not isinstance(entry, dict):
+            continue
+        if "folder" not in entry or "src_rel" not in entry or "dst_rel" not in entry:
+            continue
+        cleaned.append({
+            "folder": entry["folder"],
+            "src_rel": entry["src_rel"],
+            "dst_rel": entry["dst_rel"],
+            "confidence": entry.get("confidence", "manual"),
+            "reasoning": entry.get("reasoning", "from override mapping"),
+        })
+
+    elapsed = time.time() - t0
+    print(f"  Loaded {len(cleaned)} mapping(s) in {elapsed:.1f}s")
+
+    return {
+        "path_mappings": cleaned,
+        # Skip the corpus-classification phase entirely — the user has done
+        # the inference work. We still want cluster + QA to validate.
+        "is_code_project": True,
+        "project_roots": [],
+        "stage": "override_loaded",
+        "elapsed_seconds": {**state.get("elapsed_seconds", {}), "override": round(elapsed, 2)},
+    }
+
+
 # ── Routing ──────────────────────────────────────────────────────────────────
+
+def route_after_discover(state: AssembleState) -> str:
+    """If --mapping was provided, bypass all LLM inference and load it directly."""
+    return "load_override_mapping" if state.get("mapping_override") else "gate"
+
 
 def route_after_gate(state: AssembleState) -> str:
     return "classify_corpus" if state.get("is_code_project") else "end_with_explanation"
 
 
 def route_after_qa(state: AssembleState) -> str:
-    """After QA: in --dry-run, always terminate. Otherwise retry path inference
-    if QA failed, or proceed to materialize on pass."""
+    """After QA:
+    - In --dry-run, always terminate (never write, never retry)
+    - In --mapping override mode, never retry (the user supplied the mapping;
+      retrying would discard it and re-run LLM inference)
+    - Otherwise: retry on failure, materialize on pass
+    """
     if state.get("dry_run"):
         return "end_dry_run"
+    if state.get("mapping_override"):
+        return "materialize"
     return "materialize" if state.get("qa_passed") else "plan_paths"
 
 
@@ -954,6 +1151,7 @@ def build_assemble_graph():
     graph = StateGraph(AssembleState)
 
     graph.add_node("discover", discover_node)
+    graph.add_node("load_override_mapping", load_override_mapping_node)
     graph.add_node("gate", gate_node)
     graph.add_node("classify_corpus", classify_corpus_node)
     graph.add_node("end_with_explanation", end_with_explanation_node)
@@ -965,7 +1163,14 @@ def build_assemble_graph():
     graph.add_node("materialize", materialize_node)
 
     graph.add_edge(START, "discover")
-    graph.add_edge("discover", "gate")
+    graph.add_conditional_edges(
+        "discover", route_after_discover,
+        {"load_override_mapping": "load_override_mapping", "gate": "gate"},
+    )
+    # Override path: load mapping → cluster (skip all LLM inference)
+    graph.add_edge("load_override_mapping", "cluster")
+
+    # Standard path: gate → classify → plan → infer → cluster
     graph.add_conditional_edges(
         "gate", route_after_gate,
         {"classify_corpus": "classify_corpus", "end_with_explanation": "end_with_explanation"},

@@ -23,6 +23,8 @@ env/
 
 # Data / artifacts (large generated files)
 data/
+OUTPUT/
+ratita/
 
 # Input videos folder
 input-videos/
