@@ -154,11 +154,94 @@ def ingest(
     console.print(table)
 
 
+def _best_collection_name(chromadb_path: Path, hint: str) -> str:
+    """Find the best collection name in a ChromaDB directory.
+
+    Tries ``hint`` first; if it has 0 items, falls back to the collection
+    with the most items (handles legacy ingestions with different naming).
+    """
+    try:
+        import chromadb
+        client = chromadb.PersistentClient(path=str(chromadb_path))
+        colls = client.list_collections()
+        # Check if hint exists and has items
+        for c in colls:
+            if c.name == hint and c.count() > 0:
+                return hint
+        # Fallback: pick collection with most items
+        best = max(colls, key=lambda c: c.count(), default=None)
+        if best and best.count() > 0:
+            return best.name
+    except Exception:
+        pass
+    return hint
+
+
+def _resolve_data_targets(data_dir: Optional[str], collection: Optional[str],
+                          config: ScreenLensConfig) -> list[tuple[Path, str]]:
+    """Resolve --data-dir / --collection into (chromadb_path, collection_name) pairs.
+
+    When data_dir points to a parent folder with multiple video sub-folders,
+    returns all of them.  Otherwise returns a single target.
+    """
+    import re as _re
+
+    targets: list[tuple[Path, str]] = []
+
+    if data_dir:
+        dp = Path(data_dir)
+
+        # Check if this is a parent directory containing multiple video folders
+        sub_chromadbs = sorted(
+            d for d in dp.iterdir()
+            if d.is_dir() and (d / "chromadb").exists()
+        ) if dp.is_dir() else []
+
+        if sub_chromadbs:
+            # Parent directory — search across all video sub-folders
+            for sub in sub_chromadbs:
+                base_slug = _re.sub(r'_\d{8}_\d{6}$', '', sub.name)
+                cname = collection or f"screenlens_{base_slug}"
+                cname = _best_collection_name(sub / "chromadb", cname)
+                targets.append((sub / "chromadb", cname))
+        elif (dp / "chromadb").exists():
+            # Single video folder
+            base_slug = _re.sub(r'_\d{8}_\d{6}$', '', dp.name)
+            cname = collection or f"screenlens_{base_slug}"
+            cname = _best_collection_name(dp / "chromadb", cname)
+            targets.append((dp / "chromadb", cname))
+
+    elif collection:
+        # Auto-infer persist_directory from collection name
+        if collection.startswith("screenlens_"):
+            slug = collection[len("screenlens_"):]
+            inferred = Path(f"./data/{slug}")
+            if not (inferred / "chromadb").exists():
+                candidates = sorted(Path("./data").glob(f"{slug}_*"), reverse=True)
+                for c in candidates:
+                    if (c / "chromadb").exists():
+                        inferred = c
+                        break
+            if (inferred / "chromadb").exists():
+                targets.append((inferred / "chromadb", collection))
+
+    # Fallback: default config
+    if not targets:
+        targets.append((
+            Path(config.vector_db.persist_directory),
+            config.vector_db.collection_name,
+        ))
+
+    return targets
+
+
 @app.command()
 def search(
     query: str = typer.Argument(..., help="Natural language search query"),
     top_k: int = typer.Option(10, help="Number of results to return"),
     summarize: bool = typer.Option(True, help="Generate LLM summary of results"),
+    collection: Optional[str] = typer.Option(None, help="ChromaDB collection name (e.g. screenlens_existinginvestment)"),
+    data_dir: Optional[str] = typer.Option(None, help="Data directory — a single video folder or the parent ./data/ for all"),
     ollama_url: str = typer.Option("http://127.0.0.1:11434", help="Ollama API URL"),
     device: str = typer.Option("mps", help="Device for CLIP: mps, cuda, cpu"),
     config_file: Optional[str] = typer.Option(None, help="Path to config JSON file"),
@@ -169,34 +252,90 @@ def search(
     config.search.base_url = ollama_url
     config.embedding.device = device
 
-    console.print(f"\n[bold cyan]Searching:[/bold cyan] '{query}'\n")
+    targets = _resolve_data_targets(data_dir, collection, config)
+    multi = len(targets) > 1
 
-    pipeline = build_search_graph()
-    state = {"query": query, "config": config.model_dump()}
-    result = pipeline.invoke(state)
+    console.print(f"\n[bold cyan]Searching:[/bold cyan] '{query}'")
+    if multi:
+        console.print(f"[dim]  Searching across {len(targets)} collections[/dim]")
+    console.print()
 
-    results = result.get("search_results", [])
-    if not results:
+    all_results = []
+    summaries: list[tuple[str, str]] = []  # (source_name, summary_text)
+
+    for chroma_path, coll_name in targets:
+        cfg_copy = config.model_copy(deep=True)
+        cfg_copy.vector_db.persist_directory = str(chroma_path)
+        cfg_copy.vector_db.collection_name = coll_name
+
+        pipeline = build_search_graph()
+        state = {"query": query, "config": cfg_copy.model_dump()}
+        result = pipeline.invoke(state)
+
+        results = result.get("search_results", [])
+        # Tag results with their source collection
+        for r in results:
+            r["_collection"] = coll_name
+        all_results.extend(results)
+        if result.get("summary"):
+            source_label = coll_name.replace("screenlens_", "")
+            summaries.append((source_label, result["summary"]))
+
+    # When searching multiple collections, ensure representation from each source
+    if multi and len(targets) > 1:
+        # Guarantee at least min_per results from each collection
+        min_per = max(2, top_k // len(targets))
+        by_source: dict[str, list] = {}
+        for r in all_results:
+            by_source.setdefault(r.get("_collection", ""), []).append(r)
+        # Sort each source by score
+        for k in by_source:
+            by_source[k].sort(key=lambda r: r.get("score", 0), reverse=True)
+        # Build balanced result list
+        balanced = []
+        seen = set()
+        # First pass: take min_per from each source
+        for k, items in by_source.items():
+            for item in items[:min_per]:
+                balanced.append(item)
+                seen.add(id(item))
+        # Second pass: fill remaining slots by score
+        remainder = [r for r in all_results if id(r) not in seen]
+        remainder.sort(key=lambda r: r.get("score", 0), reverse=True)
+        balanced.extend(remainder)
+        all_results = balanced[:top_k]
+    else:
+        all_results.sort(key=lambda r: r.get("score", 0), reverse=True)
+        all_results = all_results[:top_k]
+
+    if not all_results:
         console.print("[yellow]No results found.[/yellow]")
         return
 
-    table = Table(title=f"Top {len(results)} Results")
+    table = Table(title=f"Top {len(all_results)} Results")
     table.add_column("#", justify="right", width=3)
+    if multi:
+        table.add_column("Source", style="magenta", width=20)
     table.add_column("Time", style="cyan", width=12)
     table.add_column("Score", justify="right", width=8)
     table.add_column("Caption", max_width=80)
 
-    for i, r in enumerate(results):
-        table.add_row(
-            str(i + 1),
+    for i, r in enumerate(all_results):
+        row = [str(i + 1)]
+        if multi:
+            row.append(r.get("_collection", "?").replace("screenlens_", ""))
+        row.extend([
             r.get("timestamp_str", "?"),
             f"{r.get('score', 0):.3f}",
             r.get("caption", "")[:120] + "...",
-        )
+        ])
+        table.add_row(*row)
     console.print(table)
 
-    if summarize and result.get("summary"):
-        console.print(Panel(result["summary"], title="[bold]Summary[/bold]", border_style="green"))
+    if summarize and summaries:
+        for source_label, summary_text in summaries:
+            title = f"[bold]Summary — {source_label}[/bold]" if multi else "[bold]Summary[/bold]"
+            console.print(Panel(summary_text, title=title, border_style="green"))
 
 
 @app.command()
@@ -358,6 +497,7 @@ def batch(
 
 @app.command()
 def reconstruct(
+    folder: Optional[str] = typer.Argument(None, help="Specific video folder to reconstruct (e.g. existinginvestment_20260408_223036)"),
     data_dir: str = typer.Option("./data", help="Base data directory containing ingested video folders"),
     mlx_repo: str = typer.Option(
         "mlx-community/Qwen3.5-122B-A10B-bf16",
@@ -370,6 +510,10 @@ def reconstruct(
     Scans all folders in the data directory, classifies each recording
     (Python code, Markdown doc, PDF, or GUI demo), and uses LangGraph
     deep agents to reconstruct the original artifacts with QA reflection.
+
+    Examples:
+        screenlens reconstruct                                    # Reconstruct all videos
+        screenlens reconstruct existinginvestment_20260408_223036  # Reconstruct one video
     """
     from .reconstruct import reconstruct_folder
 
@@ -378,11 +522,28 @@ def reconstruct(
         console.print(f"[red]Error: Data directory not found: {data_dir}[/red]")
         raise typer.Exit(1)
 
-    # Find all folders with captions
-    folders = sorted(
-        d for d in base.iterdir()
-        if d.is_dir() and (d / "captions" / "all_captions.json").exists()
-    )
+    # Find folders to process
+    if folder:
+        # Target specific folder
+        specific = base / folder
+        if not specific.is_dir():
+            # Try to find matching folder (with or without timestamp)
+            matches = sorted(
+                d for d in base.iterdir()
+                if d.is_dir() and folder in d.name and (d / "captions" / "all_captions.json").exists()
+            )
+            if matches:
+                specific = matches[0]
+            else:
+                console.print(f"[red]Error: Folder not found: {folder}[/red]")
+                raise typer.Exit(1)
+        folders = [specific]
+    else:
+        # Find all folders with captions
+        folders = sorted(
+            d for d in base.iterdir()
+            if d.is_dir() and (d / "captions" / "all_captions.json").exists()
+        )
 
     if not folders:
         console.print(f"[yellow]No ingested video data found in {data_dir}[/yellow]")
