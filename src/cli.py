@@ -622,6 +622,60 @@ def reconstruct(
 
 
 @app.command()
+def assemble(
+    data_dir: str = typer.Option("./data", help="Directory containing data/*/output/ artifacts"),
+    output_dir: str = typer.Option("./OUTPUT", help="Where to write the assembled tree"),
+    mlx_repo: str = typer.Option(
+        "mlx-community/Qwen3.5-122B-A10B-bf16",
+        help="HuggingFace repo ID for MLX model used for inference"
+    ),
+    mapping: Optional[str] = typer.Option(None, help="Path to a hand-edited MANIFEST.json — skips LLM inference"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Stop after corpus classification, write nothing"),
+    config_file: Optional[str] = typer.Option(None, help="Path to config JSON file"),
+):
+    """Assemble per-folder reconstructions into a single project tree.
+
+    Detects whether the corpus represents a coding project, infers the original
+    source-tree path of every artifact via batched LLM sub-agents, validates the
+    assembled tree, and writes to OUTPUT/<timestamp>/.
+
+    Examples:
+        screenlens assemble                                # full pipeline
+        screenlens assemble --dry-run                      # gate + classify only
+        screenlens assemble --mapping path/to/manifest.json  # skip inference
+    """
+    from .assemble import assemble_corpus
+
+    config = _load_config(config_file)
+    config.captioning.mlx_repo_id = mlx_repo
+
+    console.print(Panel.fit(
+        f"[bold green]ScreenLens — Corpus Assembly[/bold green]\n"
+        f"Data dir:   {Path(data_dir).resolve()}\n"
+        f"Output dir: {Path(output_dir).resolve()}\n"
+        f"Model:      {mlx_repo.split('/')[-1]}\n"
+        f"Mode:       {'DRY RUN' if dry_run else 'FULL'}"
+        + (f"\nMapping:    {mapping}" if mapping else ""),
+        title="Assembly Pipeline",
+    ))
+
+    t0 = time.time()
+    result = assemble_corpus(
+        data_dir=data_dir,
+        output_dir=output_dir,
+        config=config,
+        mapping_override=mapping,
+        dry_run=dry_run,
+    )
+    elapsed = time.time() - t0
+
+    console.print(f"\n[bold]Pipeline finished in {elapsed:.1f}s[/bold]")
+    console.print(f"  Final stage: {result.get('stage', '?')}")
+    if result.get("stage") == "gate_failed":
+        console.print(f"  [yellow]Gate decided this is not a coding project — nothing to assemble[/yellow]")
+
+
+@app.command()
 def info(
     config_file: Optional[str] = typer.Option(None, help="Path to config JSON file"),
 ):
