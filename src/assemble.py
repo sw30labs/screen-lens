@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -87,6 +88,37 @@ CLASSIFY_CORPUS_SYSTEM = (
     "Respond with ONLY valid JSON (no markdown fences):\n"
     '{"roots": ["root1", "root2", ...], "confidence": 0.0-1.0, '
     '"reasoning": "brief explanation"}'
+)
+
+
+QA_ASSEMBLY_SYSTEM = (
+    "You are reviewing an assembled project tree for structural coherence.\n\n"
+    "INPUT: the proposed file tree (as a flat list of paths) plus mechanical "
+    "findings — unresolved local imports, orphan files, and root-distribution "
+    "anomalies.\n\n"
+    "Decide whether the assembly is acceptable or whether path inference should "
+    "be retried with feedback.\n\n"
+    "PASS criteria:\n"
+    "- Local imports either resolve OR clearly reference an absent third-party "
+    "name (not the project's own modules)\n"
+    "- Orphans are limited to plausible entry points (main.py, __main__.py, "
+    "app.py, cli.py, conftest.py, test_*.py, run_*.py)\n"
+    "- The directory hierarchy is internally consistent — files that share a "
+    "package prefix live under the same root\n\n"
+    "Severity levels:\n"
+    '- "ok": the assembly is fine, materialize as-is\n'
+    '- "minor": small issues, materialize but flag in the report\n'
+    '- "critical": structural drift (wrong root, missing parent dir, broken '
+    "package layout) — RETRY path inference with feedback\n\n"
+    "When severity is critical, populate specific_remappings with concrete fixes "
+    "the next inference pass should apply. Each entry: {folder, from, to}.\n\n"
+    "Respond with ONLY valid JSON (no markdown fences):\n"
+    "{\n"
+    '  "passed": true/false,\n'
+    '  "severity": "ok|minor|critical",\n'
+    '  "feedback": "specific issues to address if retrying",\n'
+    '  "specific_remappings": [{"folder": "...", "from": "...", "to": "..."}]\n'
+    "}"
 )
 
 
@@ -578,9 +610,262 @@ def cluster_node(state: AssembleState) -> dict:
 # ── Stub nodes (filled in step 4+) ───────────────────────────────────────────
 
 
+ENTRYPOINT_PATTERNS = (
+    "main.py", "__main__.py", "app.py", "cli.py", "conftest.py",
+    "run.py", "manage.py", "setup.py", "wsgi.py", "asgi.py",
+)
+
+
+def _is_entrypoint(path: str) -> bool:
+    name = path.rsplit("/", 1)[-1]
+    if name in ENTRYPOINT_PATTERNS or name.startswith("test_") or name.startswith("run_"):
+        return True
+    return False
+
+
+def _extract_python_imports(source: str) -> tuple[list[str], list[tuple[str, str | None]]]:
+    """Return (absolute_imports, from_imports) where from_imports is [(module, name), ...].
+    Falls back to regex if AST parsing fails (partial reconstructions are possible)."""
+    import ast
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        # Fall back to regex extraction — better than nothing on broken files
+        absolute = re.findall(r"^\s*import\s+([\w.]+)", source, flags=re.MULTILINE)
+        from_lines = re.findall(r"^\s*from\s+([\w.]+)\s+import\s+(.+)$", source, flags=re.MULTILINE)
+        from_imports = []
+        for mod, names in from_lines:
+            for n in names.split(","):
+                from_imports.append((mod, n.strip().split(" as ")[0]))
+        return absolute, from_imports
+
+    absolute_imports: list[str] = []
+    from_imports: list[tuple[str, str | None]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                absolute_imports.append(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module is None:
+                # relative import like "from . import x" — module unknown without context
+                continue
+            # Skip relative imports (level > 0) — they're contextual and AST-resolvable
+            # only with the package layout. We'll detect them via the prefix instead.
+            if node.level > 0:
+                continue
+            for alias in node.names:
+                from_imports.append((node.module, alias.name))
+    return absolute_imports, from_imports
+
+
+# A small stdlib allow-list for the common cases. We don't need to be exhaustive
+# — anything that's NOT in the assembled tree and NOT in this list is treated as
+# third-party and ignored. Only "looks like project module but doesn't resolve"
+# triggers a finding.
+_STDLIB_PREFIXES = {
+    "abc", "argparse", "ast", "asyncio", "base64", "collections", "concurrent",
+    "contextlib", "copy", "csv", "dataclasses", "datetime", "decimal", "enum",
+    "functools", "glob", "hashlib", "heapq", "http", "importlib", "inspect",
+    "io", "itertools", "json", "logging", "math", "operator", "os", "pathlib",
+    "pickle", "platform", "queue", "random", "re", "shlex", "shutil", "signal",
+    "socket", "sqlite3", "string", "struct", "subprocess", "sys", "tempfile",
+    "textwrap", "threading", "time", "traceback", "types", "typing", "unicodedata",
+    "unittest", "urllib", "uuid", "warnings", "weakref", "xml", "yaml", "zipfile",
+    "__future__",
+}
+
+
+def _qa_mechanical_check(mappings: list[dict], artifacts_by_key: dict) -> dict:
+    """Run AST-based import resolution + orphan detection on the assembled tree.
+
+    Returns a findings dict with keys:
+      - assembled_paths: sorted list of all dst_rel paths
+      - unresolved_imports: [(file, module)] — local-looking imports that don't resolve
+      - orphans: [path] — files no one imports and not entrypoint-shaped
+      - root_distribution: {root: count}
+    """
+    # Build the set of assembled module paths. A file at "src/services/main.py"
+    # corresponds to the importable name "src.services.main".
+    assembled_paths = sorted(m["dst_rel"] for m in mappings)
+    py_files = [m for m in mappings if m["dst_rel"].endswith(".py")]
+
+    importable_names: set[str] = set()
+    for m in py_files:
+        path = m["dst_rel"]
+        # Strip .py and convert / to .
+        modname = path[:-3].replace("/", ".")
+        importable_names.add(modname)
+        # Also register parent packages (e.g. "src", "src.services")
+        parts = modname.split(".")
+        for i in range(1, len(parts)):
+            importable_names.add(".".join(parts[:i]))
+        # And bare-package import (drop "__init__")
+        if parts[-1] == "__init__":
+            importable_names.add(".".join(parts[:-1]))
+
+    # Detect what each file imports and whether it resolves.
+    unresolved: list[tuple[str, str]] = []
+    imported_by: dict[str, set[str]] = {}  # module → set of files that import it
+    for m in py_files:
+        key = (m["folder"], m["src_rel"])
+        artifact = artifacts_by_key.get(key)
+        if not artifact:
+            continue
+        try:
+            source = Path(artifact["src_abs"]).read_text(errors="replace")
+        except Exception:
+            continue
+
+        absolute, from_imports = _extract_python_imports(source)
+        all_modules = list(absolute) + [mod for mod, _ in from_imports]
+
+        for mod in all_modules:
+            top = mod.split(".")[0]
+            # Skip stdlib
+            if top in _STDLIB_PREFIXES:
+                continue
+            # If it resolves to something in the assembled tree, record it
+            if mod in importable_names or any(name == mod or name.startswith(mod + ".") for name in importable_names):
+                imported_by.setdefault(mod, set()).add(m["dst_rel"])
+                continue
+            # Looks like a local module if it shares a prefix with any assembled root
+            project_roots = {p.split(".")[0] for p in importable_names}
+            if top in project_roots:
+                unresolved.append((m["dst_rel"], mod))
+
+    # Detect orphans: files that nothing imports AND aren't entrypoint-shaped
+    referenced_paths: set[str] = set()
+    for paths in imported_by.values():
+        referenced_paths.update(paths)
+    orphans: list[str] = []
+    for m in py_files:
+        path = m["dst_rel"]
+        if path in referenced_paths:
+            continue
+        if _is_entrypoint(path):
+            continue
+        # __init__.py is structurally important even if not imported by name
+        if path.endswith("__init__.py"):
+            continue
+        orphans.append(path)
+
+    # Root distribution
+    root_dist: dict[str, int] = {}
+    for path in assembled_paths:
+        head, _, _ = path.partition("/")
+        if "/" not in path:
+            head = "(root)"
+        root_dist[head] = root_dist.get(head, 0) + 1
+
+    return {
+        "total_files": len(assembled_paths),
+        "python_files": len(py_files),
+        "unresolved_imports": unresolved,
+        "orphans": orphans,
+        "root_distribution": root_dist,
+    }
+
+
 def qa_reflect_node(state: AssembleState) -> dict:
-    """STUB — implemented in step 4."""
-    return {"qa_passed": True, "qa_findings": {}, "stage": "qa_passed"}
+    """Validate the assembled tree: mechanical checks + LLM judgment.
+
+    On critical severity, sets qa_passed=False so the graph loops back to
+    plan_paths_node with qa_feedback for a retry. On ok or minor, sets
+    qa_passed=True so the graph proceeds to materialize.
+    """
+    t0 = time.time()
+    qa_iteration = state.get("qa_iteration", 0)
+    mappings = state.get("path_mappings", [])
+    artifacts = state.get("artifacts", [])
+
+    print(f"\n{'='*60}")
+    print(f"[7/8] QA REFLECT — iteration {qa_iteration + 1}/{MAX_QA_ITERATIONS}")
+    print(f"      Validating {len(mappings)} mapping(s)")
+    print(f"{'='*60}")
+
+    artifacts_by_key = {(a["folder"], a["src_rel"]): a for a in artifacts}
+
+    # Phase 1: mechanical
+    findings = _qa_mechanical_check(mappings, artifacts_by_key)
+    print(f"\n  Mechanical findings:")
+    print(f"    Files:               {findings['total_files']} ({findings['python_files']} Python)")
+    print(f"    Unresolved imports:  {len(findings['unresolved_imports'])}")
+    print(f"    Orphans:             {len(findings['orphans'])}")
+    print(f"    Root distribution:   {findings['root_distribution']}")
+    if findings["unresolved_imports"]:
+        print(f"    Sample unresolved:")
+        for f, mod in findings["unresolved_imports"][:5]:
+            print(f"      {f} → {mod}")
+    if findings["orphans"]:
+        print(f"    Sample orphans:")
+        for o in findings["orphans"][:5]:
+            print(f"      {o}")
+
+    # Phase 2: LLM judgment.
+    config = ScreenLensConfig(**state["config"])
+    model, tokenizer = get_mlx_model(config)
+
+    tree_lines = "\n".join(f"  {p}" for p in sorted(m["dst_rel"] for m in mappings))
+    unresolved_text = "\n".join(f"  - {f}: imports '{mod}' (not in tree)"
+                                  for f, mod in findings["unresolved_imports"][:30]) or "  (none)"
+    orphans_text = "\n".join(f"  - {o}" for o in findings["orphans"][:20]) or "  (none)"
+
+    user_prompt = (
+        f"Proposed assembled tree ({findings['total_files']} files):\n"
+        f"{tree_lines}\n\n"
+        f"Root distribution: {findings['root_distribution']}\n\n"
+        f"Unresolved local imports ({len(findings['unresolved_imports'])} total, "
+        f"showing up to 30):\n{unresolved_text}\n\n"
+        f"Orphans ({len(findings['orphans'])} total, showing up to 20):\n{orphans_text}\n\n"
+        "Is this assembly acceptable? Decide pass/severity/feedback per the system prompt."
+    )
+
+    response = mlx_generate(
+        model, tokenizer, QA_ASSEMBLY_SYSTEM, user_prompt,
+        max_tokens=1024, temperature=0.1,
+    )
+    result = parse_json_response(response)
+
+    severity = result.get("severity", "minor")
+    passed = bool(result.get("passed", severity != "critical"))
+    feedback = result.get("feedback", "")
+    remappings = result.get("specific_remappings", [])
+
+    # Force-pass on the last iteration (always materialize what we have rather
+    # than failing — the report will flag any open issues for manual fix).
+    if qa_iteration + 1 >= MAX_QA_ITERATIONS and not passed:
+        print(f"\n  Max QA iterations reached — proceeding to materialize with current mapping")
+        passed = True
+        severity = "minor"
+
+    elapsed = time.time() - t0
+    print(f"\n  Decision: {'PASS' if passed else 'RETRY'} (severity: {severity})")
+    if feedback:
+        print(f"  Feedback: {feedback[:200]}")
+    if remappings and not passed:
+        print(f"  Specific remappings ({len(remappings)}):")
+        for r in remappings[:5]:
+            print(f"    {r.get('folder')}: {r.get('from')} → {r.get('to')}")
+    print(f"  QA in {elapsed:.1f}s")
+
+    # Build the qa_feedback string injected into the next inference round
+    qa_feedback_str = feedback
+    if remappings:
+        qa_feedback_str += "\n\nSpecific remappings to apply:\n" + "\n".join(
+            f"- folder '{r.get('folder')}': change dst_rel from '{r.get('from')}' "
+            f"to '{r.get('to')}'"
+            for r in remappings
+        )
+
+    return {
+        "qa_passed": passed,
+        "qa_findings": findings,
+        "qa_feedback": qa_feedback_str,
+        "qa_iteration": qa_iteration + 1,
+        "stage": "qa_reflected",
+        "elapsed_seconds": {**state.get("elapsed_seconds", {}), f"qa_{qa_iteration + 1}": round(elapsed, 2)},
+    }
 
 
 def materialize_node(state: AssembleState) -> dict:
@@ -604,21 +889,24 @@ def route_after_gate(state: AssembleState) -> str:
     return "classify_corpus" if state.get("is_code_project") else "end_with_explanation"
 
 
-def route_after_cluster(state: AssembleState) -> str:
-    """In --dry-run, terminate after clustering (everything LLM-driven is done).
-    Otherwise continue to QA reflection."""
-    return "end_dry_run" if state.get("dry_run") else "qa_reflect"
+def route_after_qa(state: AssembleState) -> str:
+    """After QA: in --dry-run, always terminate. Otherwise retry path inference
+    if QA failed, or proceed to materialize on pass."""
+    if state.get("dry_run"):
+        return "end_dry_run"
+    return "materialize" if state.get("qa_passed") else "plan_paths"
 
 
 def end_dry_run_node(state: AssembleState) -> dict:
     """Terminal node for --dry-run mode. Prints summary and dumps the full
     mapping JSON to ./data/.assemble_dry_run.json for inspection."""
     print(f"\n{'='*60}")
-    print(f"DRY RUN — stopping before QA / materialize")
+    print(f"DRY RUN — stopping before materialize")
     print(f"{'='*60}")
     mappings = state.get("path_mappings", [])
     clusters = state.get("clusters", {})
     collisions = state.get("collisions", [])
+    findings = state.get("qa_findings", {})
 
     conf_counts = {"high": 0, "medium": 0, "low": 0}
     for m in mappings:
@@ -628,6 +916,10 @@ def end_dry_run_node(state: AssembleState) -> dict:
     print(f"  Confidence:        high={conf_counts['high']} medium={conf_counts['medium']} low={conf_counts['low']}")
     print(f"  Clusters:          {len(clusters)}")
     print(f"  Collisions:        {len(collisions)}")
+    if findings:
+        print(f"  QA passed:         {state.get('qa_passed')}")
+        print(f"  Unresolved imports: {len(findings.get('unresolved_imports', []))}")
+        print(f"  Orphans:            {len(findings.get('orphans', []))}")
 
     flagged = [m for m in mappings if m.get("confidence") != "high"]
     if flagged:
@@ -681,15 +973,17 @@ def build_assemble_graph():
     graph.add_edge("classify_corpus", "plan_paths")
     graph.add_edge("plan_paths", "infer_paths_sequential")
     graph.add_edge("infer_paths_sequential", "cluster")
-    graph.add_conditional_edges(
-        "cluster", route_after_cluster,
-        {"end_dry_run": "end_dry_run", "qa_reflect": "qa_reflect"},
-    )
+    graph.add_edge("cluster", "qa_reflect")
     graph.add_edge("end_with_explanation", END)
     graph.add_edge("end_dry_run", END)
 
-    # Stub edges — qa_reflect → materialize → END will become real in steps 4–5
-    graph.add_edge("qa_reflect", "materialize")
+    # Reflection loop: qa_reflect → plan_paths (retry), materialize (proceed),
+    # or end_dry_run (--dry-run termination — runs through QA but never writes)
+    graph.add_conditional_edges(
+        "qa_reflect", route_after_qa,
+        {"plan_paths": "plan_paths", "materialize": "materialize", "end_dry_run": "end_dry_run"},
+    )
+    # Stub: materialize → END will become real in step 5
     graph.add_edge("materialize", END)
 
     return graph.compile()
