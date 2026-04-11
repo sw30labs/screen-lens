@@ -569,6 +569,13 @@ def reconstruct(
         console.print(f"[bold magenta]  Folder {i}/{len(folders)}: {folder.name}[/bold magenta]")
         console.print(f"[bold magenta]{'='*60}[/bold magenta]")
 
+        # Skip folders already successfully reconstructed (meta.json is only
+        # written on success). Delete output/ to force a re-run.
+        if (folder / "output" / "reconstruction_meta.json").exists():
+            console.print(f"[dim]  Skipped — already reconstructed (delete output/ to redo)[/dim]")
+            results_summary.append((folder.name, "skipped", 0.0))
+            continue
+
         t0 = time.time()
         try:
             result = reconstruct_folder(str(folder), config)

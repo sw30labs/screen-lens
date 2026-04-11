@@ -950,6 +950,7 @@ def save_node(state: ReconstructState) -> dict:
     saved = []
     for artifact in latest:
         filepath = output_dir / artifact["filename"]
+        filepath.parent.mkdir(parents=True, exist_ok=True)
         filepath.write_text(artifact["content"])
         saved.append(str(filepath))
         print(f"  saved {artifact['filename']} ({len(artifact['content']):,} chars)")
