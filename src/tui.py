@@ -16,6 +16,7 @@ from urllib.error import HTTPError
 
 from .config import CaptionBackend, ScreenLensConfig
 from .omlx_client import (
+    is_known_text_only_model,
     resolve_omlx_api_key,
     resolve_omlx_base_url,
     resolve_omlx_model,
@@ -74,17 +75,20 @@ def _summary_rows(config: ScreenLensConfig, config_path: Path | None) -> list[tu
         ("oMLX URL", resolve_omlx_base_url(config.captioning)),
         ("oMLX key", _yes_no(bool(resolve_omlx_api_key(config.captioning)))),
         ("Embedding", f"{config.embedding.model_name} on {config.embedding.device}"),
-        ("Search top_k", str(config.search.top_k)),
     ]
 
 
 def _omlx_model_options(model_ids: Iterable[str], configured_model: str) -> list[tuple[str, str]]:
-    """Build unique Select options, preserving the configured model if absent."""
+    """Build unique Select options, hiding known text-only models."""
     unique: list[str] = []
     for model_id in model_ids:
-        if model_id and model_id not in unique:
+        if model_id and not is_known_text_only_model(model_id) and model_id not in unique:
             unique.append(model_id)
-    if configured_model and configured_model not in unique:
+    if (
+        configured_model
+        and not is_known_text_only_model(configured_model)
+        and configured_model not in unique
+    ):
         unique.insert(0, configured_model)
     return [(model_id, model_id) for model_id in unique]
 
@@ -181,8 +185,7 @@ def run_tui(config_path: str | Path | None = None) -> int:
         SUB_TITLE = "Local video scene intelligence"
         BINDINGS = [
             ("ctrl+i", "ingest", "Ingest"),
-            ("ctrl+r", "run_full", "Run"),
-            ("ctrl+s", "search", "Search"),
+            ("ctrl+r", "ingest_reconstruct", "Reconstruct"),
             ("ctrl+q", "quit", "Quit"),
         ]
         CSS = """
@@ -201,7 +204,7 @@ def run_tui(config_path: str | Path | None = None) -> int:
             margin-bottom: 1;
         }
 
-        #config-path, #video-path, #query, #data-dir, #output-dir {
+        #config-path, #video-path, #data-dir, #output-dir {
             width: 1fr;
         }
 
@@ -275,17 +278,14 @@ def run_tui(config_path: str | Path | None = None) -> int:
                     yield Select([], prompt="Select oMLX model", allow_blank=True, id="omlx-model")
                     yield Button("Refresh Models", id="refresh-models", variant="default")
                 with Horizontal(classes="row"):
-                    yield Input(placeholder="Video path for ingest/run", id="video-path")
-                    yield Input(placeholder="Search question for Run/Search only", id="query")
+                    yield Input(placeholder="Video path for ingest/reconstruct", id="video-path")
                 with Horizontal(classes="row"):
                     yield Input(value="./data", placeholder="./data", id="data-dir")
                     yield Input(value="./OUTPUT", placeholder="./OUTPUT", id="output-dir")
                 with Horizontal(classes="row"):
-                    yield Button("Ingest", id="ingest", variant="primary")
-                    yield Button("Run", id="run", variant="primary")
-                    yield Button("Search", id="search", variant="default")
-                    yield Button("Summarize", id="summarize", variant="default")
-                    yield Button("Reconstruct", id="reconstruct", variant="default")
+                    yield Button("Ingest + Reconstruct", id="ingest-reconstruct", variant="primary")
+                    yield Button("Ingest Only", id="ingest", variant="default")
+                    yield Button("Reconstruct Existing", id="reconstruct", variant="default")
                     yield Button("Assemble", id="assemble", variant="default")
             with Horizontal(id="main"):
                 yield Static(id="summary")
@@ -307,12 +307,8 @@ def run_tui(config_path: str | Path | None = None) -> int:
                 self.action_refresh_models()
             elif button_id == "ingest":
                 self.action_ingest()
-            elif button_id == "run":
-                self.action_run_full()
-            elif button_id == "search":
-                self.action_search()
-            elif button_id == "summarize":
-                self.action_summarize()
+            elif button_id == "ingest-reconstruct":
+                self.action_ingest_reconstruct()
             elif button_id == "reconstruct":
                 self.action_reconstruct()
             elif button_id == "assemble":
@@ -341,14 +337,8 @@ def run_tui(config_path: str | Path | None = None) -> int:
         def action_ingest(self) -> None:
             self._start_task("ingest", self._task_ingest)
 
-        def action_run_full(self) -> None:
-            self._start_task("run", self._task_run_full)
-
-        def action_search(self) -> None:
-            self._start_task("search", self._task_search)
-
-        def action_summarize(self) -> None:
-            self._start_task("summarize", self._task_summarize)
+        def action_ingest_reconstruct(self) -> None:
+            self._start_task("ingest+reconstruct", self._task_ingest_reconstruct)
 
         def action_reconstruct(self) -> None:
             self._start_task("reconstruct", self._task_reconstruct)
@@ -412,10 +402,11 @@ def run_tui(config_path: str | Path | None = None) -> int:
             select.set_options(options)
             selected = self.selected_omlx_model or configured_model
             if selected not in {value for _, value in options}:
-                selected = configured_model
-            select.value = selected
+                selected = options[0][1] if options else configured_model
+            if options:
+                select.value = selected
             select.prompt = "Loading oMLX models..." if self.models_loading else "Select oMLX model"
-            select.disabled = self.running or self.models_loading
+            select.disabled = self.running or self.models_loading or not options
             refresh.disabled = self.running or self.models_loading
             self.selected_omlx_model = selected
 
@@ -463,11 +454,17 @@ def run_tui(config_path: str | Path | None = None) -> int:
             if model_to_select in {value for _, value in options}:
                 select.value = model_to_select
                 self.selected_omlx_model = model_to_select
+            elif options:
+                model_to_select = options[0][1]
+                select.value = model_to_select
+                self.selected_omlx_model = model_to_select
             if error and not self.omlx_model_ids:
                 select.prompt = OMLX_AUTH_HINT if _is_omlx_auth_error(error) else "Model list unavailable"
+            elif not options:
+                select.prompt = "No vision-capable oMLX models found"
             else:
                 select.prompt = "Select oMLX model"
-            select.disabled = self.running
+            select.disabled = self.running or not options
             self.query_one("#refresh-models", Button).disabled = self.running
 
             if error:
@@ -478,7 +475,9 @@ def run_tui(config_path: str | Path | None = None) -> int:
                     "yellow",
                 )
                 return
-            self.write_log(f"Loaded {len(models)} oMLX model(s).")
+            filtered = len(models) - len(options)
+            suffix = f" ({filtered} text-only hidden)" if filtered else ""
+            self.write_log(f"Loaded {len(options)} vision-capable oMLX model(s){suffix}.")
             self.current_config = self._build_config_from_controls()
             self._update_summary(_summary_rows(self.current_config, self._config_path()))
 
@@ -537,33 +536,38 @@ def run_tui(config_path: str | Path | None = None) -> int:
                 "config": config.model_dump(),
             })
 
-        def _task_run_full(self) -> dict[str, Any]:
-            from .pipeline import build_full_graph
+        def _task_ingest_reconstruct(self) -> dict[str, Any]:
+            from .pipeline import build_ingest_graph
+            from .reconstruct import reconstruct_folder
 
             video = self._video_path()
-            query = self._query(required=True)
             config = self._build_config_from_controls()
             _apply_video_slug(config, video)
-            return build_full_graph().invoke({
+            folder = config.data_dir
+
+            ingest_result = build_ingest_graph().invoke({
                 "video_path": str(video.resolve()),
-                "query": query,
                 "config": config.model_dump(),
             })
+            reconstruct_result = reconstruct_folder(str(folder), config)
 
-        def _task_search(self) -> dict[str, Any]:
-            from .pipeline import build_search_graph
+            if reconstruct_result.get("error"):
+                return {
+                    "error": reconstruct_result["error"],
+                    "stage": "reconstruct_failed",
+                    "num_frames": ingest_result.get("num_frames", 0),
+                    "data_dir": str(folder),
+                }
 
-            config = self._build_config_from_controls()
-            return build_search_graph().invoke({
-                "query": self._query(required=True),
-                "config": config.model_dump(),
-            })
-
-        def _task_summarize(self) -> dict[str, Any]:
-            from .pipeline import summarize_all_node
-
-            config = self._build_config_from_controls()
-            return summarize_all_node({"config": config.model_dump()})
+            return {
+                "stage": "reconstructed",
+                "num_frames": ingest_result.get("num_frames", 0),
+                "content_type": reconstruct_result.get("content_type", "unknown"),
+                "saved_paths": reconstruct_result.get("saved_paths", []),
+                "qa_scores": reconstruct_result.get("qa_scores", {}),
+                "data_dir": str(folder),
+                "reconstruction": reconstruct_result,
+            }
 
         def _task_reconstruct(self) -> dict[str, Any]:
             from .reconstruct import reconstruct_folder
@@ -594,12 +598,6 @@ def run_tui(config_path: str | Path | None = None) -> int:
                 raise FileNotFoundError(video)
             return video
 
-        def _query(self, *, required: bool) -> str:
-            query = self.query_one("#query", Input).value.strip()
-            if required and not query:
-                raise ValueError("Query is required.")
-            return query
-
         def _caption_folders(self, data_dir: Path) -> list[Path]:
             if (data_dir / "captions" / "all_captions.json").exists():
                 return [data_dir]
@@ -624,10 +622,16 @@ def run_tui(config_path: str | Path | None = None) -> int:
                 details.append("summary=yes")
                 self.write_log("")
                 self.write_log(str(result["summary"]))
+            if "content_type" in result:
+                details.append(f"type={result['content_type']}")
             if "folders" in result:
                 details.append(f"folders={result['folders']}")
             if "saved_paths" in result:
                 details.append(f"saved={len(result['saved_paths'])}")
+                for path in result["saved_paths"]:
+                    self.write_log(str(path))
+            if "data_dir" in result:
+                details.append(f"data={result['data_dir']}")
             if "stage" in result:
                 details.append(f"stage={result['stage']}")
             suffix = ", ".join(details) if details else "complete"
@@ -640,9 +644,7 @@ def run_tui(config_path: str | Path | None = None) -> int:
                 "validate",
                 "refresh-models",
                 "ingest",
-                "run",
-                "search",
-                "summarize",
+                "ingest-reconstruct",
                 "reconstruct",
                 "assemble",
             ):

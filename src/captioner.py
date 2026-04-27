@@ -17,7 +17,7 @@ from typing import Optional
 from tqdm import tqdm
 
 from .config import CaptioningConfig, CaptionBackend
-from .omlx_client import OMLXClient, resolve_omlx_model
+from .omlx_client import OMLXClient, resolve_omlx_model, validate_omlx_vision_model
 
 logger = logging.getLogger("screenlens.captioner")
 
@@ -29,6 +29,7 @@ class OMLXCaptioner:
 
     def __init__(self, config: CaptioningConfig):
         self.config = config
+        validate_omlx_vision_model(resolve_omlx_model(config))
         self._client = OMLXClient(config)
 
     def caption(self, image_path: str) -> str:

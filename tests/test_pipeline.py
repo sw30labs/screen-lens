@@ -109,6 +109,29 @@ class TestOMLXClient:
         assert omlx_client.resolve_omlx_api_key(CaptioningConfig()) == "dotenv-key"
         assert omlx_client.resolve_omlx_model(CaptioningConfig()) == "dotenv-model"
 
+    def test_rejects_known_text_only_models_for_image_chat(self):
+        from src.config import CaptioningConfig
+        from src.omlx_client import OMLXClient
+
+        client = OMLXClient(CaptioningConfig(omlx_model="deepseek-ai-DeepSeek-V4-Flash-8bit"))
+
+        with pytest.raises(ValueError, match="text-only oMLX model"):
+            client.chat("system", "describe", images=["missing.jpg"])
+
+    def test_tui_hides_known_text_only_omlx_models(self):
+        from src.tui import _omlx_model_options
+
+        options = _omlx_model_options(
+            [
+                "MiniMax-M2.7",
+                "deepseek-ai-DeepSeek-V4-Flash-8bit",
+                "gpt-oss-120b-MXFP4-Q8",
+            ],
+            "deepseek-ai-DeepSeek-V4-Flash-8bit",
+        )
+
+        assert options == [("MiniMax-M2.7", "MiniMax-M2.7")]
+
     def test_chat_posts_openai_vision_payload(self, monkeypatch, tmp_path):
         from PIL import Image
         from src.config import CaptioningConfig

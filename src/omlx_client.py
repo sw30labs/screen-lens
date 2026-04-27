@@ -27,6 +27,16 @@ _OMLX_KEY_PLACEHOLDERS = {
     "your-omlx-api-key",
     "your-omlx-api-key-here",
 }
+_KNOWN_TEXT_ONLY_PATTERNS = (
+    "deepseek-chat",
+    "deepseek-coder",
+    "deepseek-reasoner",
+    "deepseek-r1",
+    "deepseek-v3",
+    "deepseek-v4",
+    "gpt-oss",
+)
+_KNOWN_VISION_MARKERS = ("vl", "vision", "omni", "janus")
 
 
 def _load_dotenv_if_present() -> None:
@@ -112,6 +122,26 @@ def resolve_omlx_model(config: CaptioningConfig) -> str:
     )
 
 
+def is_known_text_only_model(model_id: str | None) -> bool:
+    """Return True for served model ids that are known not to accept images."""
+    if not model_id:
+        return False
+    normalized = re.sub(r"[^a-z0-9]+", "-", model_id.lower())
+    if any(marker in normalized for marker in _KNOWN_VISION_MARKERS):
+        return False
+    return any(pattern in normalized for pattern in _KNOWN_TEXT_ONLY_PATTERNS)
+
+
+def validate_omlx_vision_model(model_id: str) -> None:
+    """Raise an actionable error if the selected model is known text-only."""
+    if is_known_text_only_model(model_id):
+        raise ValueError(
+            f"{model_id} is a text-only oMLX model. ScreenLens captioning sends "
+            "image inputs, so choose a vision-capable model such as a VL, vision, "
+            "omni, or Janus model."
+        )
+
+
 def strip_thinking(text: str) -> str:
     """Remove Qwen/DeepSeek-style thinking blocks from final user-visible text."""
     cleaned = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
@@ -169,6 +199,9 @@ class OMLXClient:
         max_tokens: int | None = None,
         temperature: float | None = None,
     ) -> str:
+        if images:
+            validate_omlx_vision_model(self.model)
+
         user_content: str | list[dict[str, Any]]
         if images:
             user_content = [{"type": "text", "text": user_prompt}]

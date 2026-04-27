@@ -20,21 +20,19 @@ Local video scene intelligence for Apple Silicon. Processes screen recordings th
 graph TD
     A[Video Input<br/>.mov / .mp4] --> B[Hybrid Keyframe Detection<br/>SSIM + pHash + HSV histogram]
     B --> C[Vision Captioning<br/>Qwen3.5-VL via oMLX]
-    C --> D[CLIP Embedding<br/>OpenCLIP ViT-B-32]
-    D --> E[Vector Store<br/>ChromaDB]
-
-    F[Natural Language Query] --> G[CLIP Text Encoder]
-    G --> H[Semantic Search<br/>ChromaDB cosine]
-    E --> H
-    H --> I[LLM Summarization<br/>Ollama llama3.2]
-    I --> J[Answer + Timestamps]
+    C --> D[Caption Archive<br/>frames + timestamps + descriptions]
+    D --> E[Content Classification<br/>code / docs / PDF / GUI demo]
+    E --> F[Reconstruction Plan<br/>files, sections, tasks]
+    F --> G[Hierarchical Reconstruction<br/>oMLX agents]
+    G --> H[QA Reflection<br/>retry when incomplete]
+    H --> I[Reconstructed Artifacts<br/>data/*/output]
 
     style A fill:#4a90d9,color:#fff
     style B fill:#8e44ad,color:#fff
     style C fill:#e74c3c,color:#fff
     style E fill:#2ecc71,color:#fff
-    style F fill:#e67e22,color:#fff
-    style J fill:#27ae60,color:#fff
+    style G fill:#e67e22,color:#fff
+    style I fill:#27ae60,color:#fff
 ```
 
 ## Pipeline Flow (LangGraph)
@@ -44,13 +42,12 @@ stateDiagram-v2
     [*] --> Ingest: video_path
     Ingest --> Caption: keyframes extracted
     Caption --> Embed: captions generated
-    Embed --> [*]: stored in ChromaDB
-
-    state "Search Pipeline" as search {
-        [*] --> Search: query text
-        Search --> Summarize: top-k results
-        Summarize --> [*]: answer + timestamps
-    }
+    Embed --> Classify: ingested folder
+    Classify --> Plan: content type
+    Plan --> Reconstruct: reconstruction tasks
+    Reconstruct --> QA: draft artifacts
+    QA --> Save: accepted or retried
+    Save --> [*]: output files
 ```
 
 ## Component Overview
@@ -61,9 +58,8 @@ stateDiagram-v2
 | Vision Captioning | **Qwen3.5-VL** via oMLX (Apple Silicon native) | Dense, high-fidelity frame descriptions through oMLX's OpenAI-compatible VLM API |
 | Fallback Captioning | Ollama (llama3.2-vision) | Cross-platform alternative |
 | Visual Embeddings | OpenCLIP ViT-B-32 | Semantic vector representations |
-| Vector Storage | ChromaDB | Persistent similarity search |
-| Text Search | CLIP text encoder | Query → embedding |
-| Summarization | Ollama (llama3.2) | Natural language answers |
+| Vector Storage | ChromaDB | Optional inspection index for ingested frames |
+| Reconstruction | LangGraph + oMLX | Classify recordings and rebuild source/docs/demo references |
 | Orchestration | LangGraph StateGraph | Pipeline state management |
 | CLI | Typer + Rich | User interface |
 
@@ -81,7 +77,7 @@ ollama pull llama3.2           # Text model for summarization
 ollama pull llama3.2-vision    # Only needed if using --backend ollama for captioning
 ```
 
-oMLX can reuse existing MLX-format model directories and exposes models through `/v1/models`. `MLX_MODEL`, `OMLX_MODEL`, or `--omlx-model` can select the served model; otherwise ScreenLens uses `default`.
+oMLX can reuse existing MLX-format model directories and exposes models through `/v1/models`. `MLX_MODEL`, `OMLX_MODEL`, or `--omlx-model` can select the served model; otherwise ScreenLens uses `default`. Captioning requires a vision-capable model; text-only models such as DeepSeek V3/V4/R1 and GPT-OSS cannot process frames.
 
 ## Installation
 
@@ -134,21 +130,7 @@ python -m src.cli batch "/path/to/recordings/"
 
 Each video gets its own data directory under `./data/<video_name>/` with separate frames, captions, embeddings, and ChromaDB collections.
 
-### 5. Search the Video
-
-```bash
-python -m src.cli search "What application is being demonstrated?"
-python -m src.cli search "Show me any error messages or warnings"
-python -m src.cli search "What buttons or menus are visible?"
-```
-
-### 6. One-Shot (Ingest + Search)
-
-```bash
-python -m src.cli run "video.mov" "Summarize what happens in this screen recording"
-```
-
-### 7. Reconstruct Artifacts from Recordings
+### 5. Reconstruct Artifacts from Recordings
 
 ```bash
 python -m src.cli reconstruct
@@ -161,19 +143,19 @@ Scans all folders in `./data/`, classifies each recording (Python code, Markdown
 - **Reflection QA** — Up to 3 iterations of quality review before saving
 - **Output** — Reconstructed files saved to `./data/<video_name>/output/`
 
-### 8. Check Status
+### 6. Check Status
 
 ```bash
 python -m src.cli info
 ```
 
-### 9. Launch the Terminal GUI
+### 7. Launch the Terminal GUI
 
 ```bash
 python -m src.cli tui
 ```
 
-The Textual/Rich GUI provides inputs for video paths, queries, data/output directories, oMLX model selection, and buttons for ingest, run, search, summarize, reconstruct, and assemble workflows.
+The Textual/Rich GUI provides inputs for video paths, data/output directories, and oMLX model selection. Use `Ingest + Reconstruct` for the main workflow: ingest the video, classify what it shows, and reconstruct the matching output from the new ingested folder.
 
 ## Keyframe Detection
 
@@ -204,7 +186,6 @@ All settings live in `src/config.py` (Pydantic models). Key parameters:
 | `captioning.max_tokens` | 1024 | Max tokens per caption |
 | `embedding.model_name` | ViT-B-32 | CLIP model |
 | `embedding.device` | mps | Apple Silicon GPU |
-| `search.top_k` | 10 | Results per query |
 
 ## Performance Notes
 
