@@ -29,8 +29,10 @@ class TestConfig:
     """Test the configuration system."""
 
     def test_default_config(self):
-        from src.config import ScreenLensConfig
+        from src.config import CaptionBackend, ScreenLensConfig
         config = ScreenLensConfig()
+        assert config.captioning.backend == CaptionBackend.omlx
+        assert config.captioning.omlx_base_url == "http://127.0.0.1:8000/v1"
         assert config.frame_extraction.fps == 1.0
         assert config.embedding.device == "mps"
         assert config.vector_db.collection_name == "screenlens_frames"
@@ -71,6 +73,90 @@ class TestFrameExtractor:
         small = Image.new("RGB", (640, 480))
         same = _resize_frame(small, 1280)
         assert same.size == (640, 480)
+
+
+class TestOMLXClient:
+    """Test the oMLX OpenAI-compatible adapter without network access."""
+
+    def test_normalizes_dashboard_url(self):
+        from src.omlx_client import normalize_omlx_base_url
+
+        assert (
+            normalize_omlx_base_url("http://127.0.0.1:8000/admin/dashboard?tab=status")
+            == "http://127.0.0.1:8000/v1"
+        )
+        assert normalize_omlx_base_url("http://127.0.0.1:8000") == "http://127.0.0.1:8000/v1"
+        assert normalize_omlx_base_url("http://127.0.0.1:8000/v1") == "http://127.0.0.1:8000/v1"
+
+    def test_dotenv_loads_omlx_values_without_overriding_shell(self, monkeypatch, tmp_path):
+        from src.config import CaptioningConfig
+        import src.omlx_client as omlx_client
+
+        (tmp_path / ".env").write_text(
+            "\n".join([
+                "MLX_API_KEY=your-omlx-api-key-here",
+                "OMLX_API_KEY=dotenv-key",
+                "MLX_MODEL=dotenv-model",
+            ]),
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("MLX_API_KEY", raising=False)
+        monkeypatch.delenv("OMLX_API_KEY", raising=False)
+        monkeypatch.delenv("MLX_MODEL", raising=False)
+        monkeypatch.setattr(omlx_client, "_DOTENV_LOADED", False)
+
+        assert omlx_client.resolve_omlx_api_key(CaptioningConfig()) == "dotenv-key"
+        assert omlx_client.resolve_omlx_model(CaptioningConfig()) == "dotenv-model"
+
+    def test_chat_posts_openai_vision_payload(self, monkeypatch, tmp_path):
+        from PIL import Image
+        from src.config import CaptioningConfig
+        from src.omlx_client import OMLXClient
+        import src.omlx_client as omlx_client
+
+        img_path = tmp_path / "frame.jpg"
+        Image.new("RGB", (4, 4), color="red").save(img_path)
+
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "choices": [{"message": {"content": "<think>hidden</think>visible caption"}}]
+                }).encode("utf-8")
+
+        def fake_urlopen(req, timeout):
+            captured["url"] = req.full_url
+            captured["headers"] = dict(req.header_items())
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        monkeypatch.setattr(omlx_client.request, "urlopen", fake_urlopen)
+
+        cfg = CaptioningConfig(
+            omlx_base_url="http://127.0.0.1:8000/admin/dashboard",
+            omlx_model="vision-model",
+            omlx_api_key="local-key",
+            omlx_timeout_seconds=12,
+        )
+        result = OMLXClient(cfg).chat("system", "describe", images=[str(img_path)])
+
+        assert result == "visible caption"
+        assert captured["url"] == "http://127.0.0.1:8000/v1/chat/completions"
+        assert captured["headers"]["Authorization"] == "Bearer local-key"
+        assert captured["timeout"] == 12
+        assert captured["payload"]["model"] == "vision-model"
+        user_content = captured["payload"]["messages"][1]["content"]
+        assert user_content[0] == {"type": "text", "text": "describe"}
+        assert user_content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
 
 
 class TestEmbedder:

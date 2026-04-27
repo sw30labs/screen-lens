@@ -19,9 +19,9 @@ Architecture (mirrors reconstruct.py):
   8. Materialize      — write OUTPUT/<timestamp>/ + MANIFEST + REPORT (no LLM)
 
 The gate-fail and qa-fail paths exit gracefully without writing OUTPUT.
-The pipeline reuses ``reconstruct.get_mlx_model``, ``reconstruct.mlx_generate``,
+The pipeline reuses ``reconstruct.get_inference_client``, ``reconstruct.generate_text``,
 and ``reconstruct.parse_json_response``, so a single Python process running
-``reconstruct --assemble`` loads the 122B model only once.
+``reconstruct --assemble`` loads the 122B client only once.
 """
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ from typing import Optional, TypedDict
 from langgraph.graph import StateGraph, START, END
 
 from .config import ScreenLensConfig
-from .reconstruct import get_mlx_model, mlx_generate, parse_json_response
+from .reconstruct import get_inference_client, generate_text, parse_json_response
 
 logger = logging.getLogger("screenlens.assemble")
 
@@ -188,8 +188,7 @@ class AssembleState(TypedDict, total=False):
     roots_reasoning: str
 
     # Path inference (single sequential node — no reducer needed because there
-    # is only one writer; parallel Send fan-out segfaults on the cached MLX
-    # model, same constraint as reconstruct.reconstruct_sequential).
+    # is only one writer).
     inference_batches: list[list[dict]]
     path_mappings: list[dict]
 
@@ -323,7 +322,7 @@ def gate_node(state: AssembleState) -> dict:
         }
 
     config = ScreenLensConfig(**state["config"])
-    model, tokenizer = get_mlx_model(config)
+    client = get_inference_client(config)
 
     # Aggregate content type distribution
     type_counts: dict[str, int] = {}
@@ -340,7 +339,7 @@ def gate_node(state: AssembleState) -> dict:
         "source tree?"
     )
 
-    response = mlx_generate(model, tokenizer, GATE_SYSTEM, user_prompt,
+    response = generate_text(client, GATE_SYSTEM, user_prompt,
                             max_tokens=512, temperature=0.1)
     result = parse_json_response(response)
 
@@ -375,7 +374,7 @@ def classify_corpus_node(state: AssembleState) -> dict:
     print(f"{'='*60}")
 
     config = ScreenLensConfig(**state["config"])
-    model, tokenizer = get_mlx_model(config)
+    client = get_inference_client(config)
 
     user_prompt = (
         f"Corpus of {len(artifacts)} artifacts. The previous gate step estimated "
@@ -386,7 +385,7 @@ def classify_corpus_node(state: AssembleState) -> dict:
         "use '' for 'top of project'."
     )
 
-    response = mlx_generate(model, tokenizer, CLASSIFY_CORPUS_SYSTEM, user_prompt,
+    response = generate_text(client, CLASSIFY_CORPUS_SYSTEM, user_prompt,
                             max_tokens=512, temperature=0.1)
     result = parse_json_response(response)
 
@@ -461,7 +460,7 @@ def _parse_inference_response(parsed, batch: list[dict]) -> list[dict]:
     for i, m in enumerate(raw):
         if not isinstance(m, dict):
             continue
-        # Backfill folder/src_rel from input order if the model omits them
+        # Backfill folder/src_rel from input order if the client omits them
         if i < len(batch):
             m.setdefault("folder", batch[i]["folder"])
             m.setdefault("src_rel", batch[i]["src_rel"])
@@ -480,8 +479,6 @@ def _parse_inference_response(parsed, batch: list[dict]) -> list[dict]:
 def infer_paths_sequential(state: AssembleState) -> dict:
     """Loop over inference batches sequentially, one LLM call per batch.
 
-    Sequential because MLX inference is not reentrant on the cached model
-    (same constraint as reconstruct.reconstruct_sequential at line 779).
     The whole loop runs inside this single graph node so the path_mappings
     list is built in-process and returned as a single state update — no
     reducer needed.
@@ -492,7 +489,7 @@ def infer_paths_sequential(state: AssembleState) -> dict:
     project_roots: list[str] = state.get("project_roots", [])
     qa_feedback: str = state.get("qa_feedback", "")
 
-    model, tokenizer = get_mlx_model(config)
+    client = get_inference_client(config)
 
     print(f"\n{'='*60}")
     print(f"[5/8] INFER PATHS — SEQUENTIAL ({len(batches)} batch(es))")
@@ -533,8 +530,8 @@ def infer_paths_sequential(state: AssembleState) -> dict:
                 f"{qa_feedback}\n"
             )
 
-        response = mlx_generate(
-            model, tokenizer, system_prompt, user_prompt,
+        response = generate_text(
+            client, system_prompt, user_prompt,
             max_tokens=2048, temperature=0.1,
         )
         parsed = parse_json_response(response)
@@ -804,7 +801,7 @@ def qa_reflect_node(state: AssembleState) -> dict:
 
     # Phase 2: LLM judgment.
     config = ScreenLensConfig(**state["config"])
-    model, tokenizer = get_mlx_model(config)
+    client = get_inference_client(config)
 
     tree_lines = "\n".join(f"  {p}" for p in sorted(m["dst_rel"] for m in mappings))
     unresolved_text = "\n".join(f"  - {f}: imports '{mod}' (not in tree)"
@@ -821,8 +818,8 @@ def qa_reflect_node(state: AssembleState) -> dict:
         "Is this assembly acceptable? Decide pass/severity/feedback per the system prompt."
     )
 
-    response = mlx_generate(
-        model, tokenizer, QA_ASSEMBLY_SYSTEM, user_prompt,
+    response = generate_text(
+        client, QA_ASSEMBLY_SYSTEM, user_prompt,
         max_tokens=1024, temperature=0.1,
     )
     result = parse_json_response(response)

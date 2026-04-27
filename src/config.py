@@ -4,7 +4,7 @@ All settings are centralized here for easy tuning.
 """
 from enum import Enum
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Optional
 
 from pydantic import BaseModel, Field
 
@@ -42,24 +42,36 @@ class FrameExtractionConfig(BaseModel):
 
 class CaptionBackend(str, Enum):
     """Which vision model backend to use for captioning."""
-    mlx_vlm = "mlx_vlm"    # Qwen3.5-VL via mlx-vlm (Apple Silicon native)
+    omlx = "omlx"           # oMLX OpenAI-compatible server (Apple Silicon native)
     ollama = "ollama"       # Any Ollama vision model (llama3.2-vision, etc.)
 
 
 class CaptioningConfig(BaseModel):
     """Settings for frame captioning."""
     backend: CaptionBackend = Field(
-        default=CaptionBackend.mlx_vlm,
-        description="Vision model backend: 'mlx_vlm' (recommended on Apple Silicon) or 'ollama'"
+        default=CaptionBackend.omlx,
+        description="Vision model backend: 'omlx' (recommended on Apple Silicon) or 'ollama'"
     )
-    # MLX-VLM settings (Qwen3.5)
-    mlx_repo_id: str = Field(
-        default="mlx-community/Qwen3.5-122B-A10B-bf16",
-        description="HuggingFace repo ID for the MLX vision model"
+    # oMLX settings (OpenAI-compatible local server)
+    omlx_base_url: str = Field(
+        default="http://127.0.0.1:8000/v1",
+        description="oMLX OpenAI-compatible API base URL"
     )
-    mlx_model_path: Optional[str] = Field(
+    omlx_model: Optional[str] = Field(
         default=None,
-        description="Override: local path to MLX model weights (auto-resolved from repo_id if None)"
+        description="Model ID served by oMLX. Defaults to MLX_MODEL, OMLX_MODEL, LLM_MODEL, then 'default'."
+    )
+    omlx_api_key: Optional[str] = Field(
+        default=None,
+        description="oMLX API key. If unset, MLX_API_KEY or OMLX_API_KEY is read from the environment."
+    )
+    omlx_timeout_seconds: float = Field(
+        default=600.0,
+        description="HTTP timeout for oMLX generation requests"
+    )
+    omlx_model_context: int = Field(
+        default=32768,
+        description="Assumed oMLX model context window for chunk planning"
     )
     # Ollama settings (fallback)
     ollama_model: str = Field(default="llama3.2-vision", description="Ollama vision model name")
@@ -70,13 +82,8 @@ class CaptioningConfig(BaseModel):
     batch_size: int = Field(
         default=4,
         description=(
-            "Frames per mlx-vlm batch_generate call (ignored by Ollama backend). "
-            "Empirically tuned on M3 Ultra 512GB with Qwen3.5-122B-A10B-bf16: "
-            "batch=4 → 1.54x speedup vs batch=1, batch=8 *regresses* to 1.22x "
-            "(likely MoE expert dispersion + compute-bound prefill). Memory is "
-            "not the bottleneck (peak ~257GB at batch=4 of 512GB UMA). Smaller "
-            "MoE models (e.g. 35B-A3B-4bit) should tolerate larger batch sizes — "
-            "re-run scripts/bench_caption_batch.py if you change mlx_repo_id."
+            "Frames per captioning chunk. For oMLX this is the number of concurrent "
+            "OpenAI-compatible requests. Ignored by Ollama."
         ),
     )
     system_prompt: str = Field(

@@ -2,7 +2,7 @@
 CLI Interface for ScreenLens.
 
 Usage:
-    python -m src.cli ingest VIDEO_PATH                     # Ingest with Qwen3.5 + keyframes
+    python -m src.cli ingest VIDEO_PATH                     # Ingest with oMLX + keyframes
     python -m src.cli ingest VIDEO_PATH --backend ollama    # Use Ollama instead
     python -m src.cli search "your query"                   # Search ingested video
     python -m src.cli run VIDEO_PATH "query"                # Ingest + search in one shot
@@ -22,6 +22,7 @@ from rich.table import Table
 from rich.panel import Panel
 
 from .config import ScreenLensConfig, CaptionBackend, ExtractionStrategy
+from .omlx_client import resolve_omlx_model
 from .pipeline import build_ingest_graph, build_search_graph, build_full_graph, summarize_all_node
 
 app = typer.Typer(
@@ -30,6 +31,8 @@ app = typer.Typer(
     rich_markup_mode="rich",
 )
 console = Console()
+
+DEFAULT_OMLX_URL = "http://127.0.0.1:8000/v1"
 
 
 def _load_config(config_path: Optional[str] = None) -> ScreenLensConfig:
@@ -55,6 +58,36 @@ def _apply_video_slug(config: ScreenLensConfig, video: Path) -> str:
     return slug
 
 
+def _apply_captioning_options(
+    config: ScreenLensConfig,
+    *,
+    backend: str = "omlx",
+    ollama_model: str = "llama3.2-vision",
+    ollama_url: str = "http://127.0.0.1:11434",
+    batch_size: int = 4,
+    omlx_url: str = DEFAULT_OMLX_URL,
+    omlx_model: Optional[str] = None,
+    omlx_api_key: Optional[str] = None,
+) -> None:
+    """Apply CLI captioning/inference flags to the config."""
+    config.captioning.backend = CaptionBackend(backend)
+    config.captioning.ollama_model = ollama_model
+    config.captioning.ollama_base_url = ollama_url
+    config.captioning.batch_size = batch_size
+    config.captioning.omlx_base_url = omlx_url
+    if omlx_model is not None:
+        config.captioning.omlx_model = omlx_model
+    if omlx_api_key is not None:
+        config.captioning.omlx_api_key = omlx_api_key
+
+
+def _caption_model_display(config: ScreenLensConfig) -> str:
+    """Return a short model label for CLI panels."""
+    if config.captioning.backend == CaptionBackend.omlx:
+        return f"{resolve_omlx_model(config.captioning).split('/')[-1]} via oMLX"
+    return f"{config.captioning.ollama_model} via Ollama"
+
+
 @app.command()
 def ingest(
     video_path: str = typer.Argument(..., help="Path to the video file (.mov, .mp4, etc.)"),
@@ -63,14 +96,13 @@ def ingest(
     fps: float = typer.Option(1.0, help="Frames per second (only for fixed_fps strategy)"),
     max_interval: float = typer.Option(4.0, help="Max seconds between keyframes (keyframe strategy)"),
     # Captioning backend
-    backend: str = typer.Option("mlx_vlm", help="Caption backend: 'mlx_vlm' or 'ollama'"),
-    mlx_repo: str = typer.Option(
-        "mlx-community/Qwen3.5-122B-A10B-bf16",
-        help="HuggingFace repo ID for MLX vision model"
-    ),
+    backend: str = typer.Option("omlx", help="Caption backend: 'omlx' or 'ollama'"),
+    omlx_url: str = typer.Option(DEFAULT_OMLX_URL, help="oMLX API URL or dashboard URL"),
+    omlx_model: Optional[str] = typer.Option(None, help="oMLX model ID (defaults to env or 'default')"),
+    omlx_api_key: Optional[str] = typer.Option(None, help="oMLX API key (defaults to MLX_API_KEY/OMLX_API_KEY)"),
     ollama_model: str = typer.Option("llama3.2-vision", help="Ollama vision model (if backend=ollama)"),
     ollama_url: str = typer.Option("http://127.0.0.1:11434", help="Ollama API URL"),
-    batch_size: int = typer.Option(4, help="Frames per mlx-vlm batch_generate call (MLX backend only)"),
+    batch_size: int = typer.Option(4, help="Frames per captioning chunk/concurrent oMLX requests"),
     # Other
     device: str = typer.Option("mps", help="Device for CLIP: mps, cuda, cpu"),
     config_file: Optional[str] = typer.Option(None, help="Path to config JSON file"),
@@ -88,12 +120,16 @@ def ingest(
     config.frame_extraction.fps = fps
     config.frame_extraction.max_interval_seconds = max_interval
 
-    # Captioning
-    config.captioning.backend = CaptionBackend(backend)
-    config.captioning.mlx_repo_id = mlx_repo
-    config.captioning.ollama_model = ollama_model
-    config.captioning.ollama_base_url = ollama_url
-    config.captioning.batch_size = batch_size
+    _apply_captioning_options(
+        config,
+        backend=backend,
+        ollama_model=ollama_model,
+        ollama_url=ollama_url,
+        batch_size=batch_size,
+        omlx_url=omlx_url,
+        omlx_model=omlx_model,
+        omlx_api_key=omlx_api_key,
+    )
     # Embedding
     config.embedding.device = device
 
@@ -101,10 +137,7 @@ def ingest(
     slug = _apply_video_slug(config, video)
 
     # Display config
-    if backend == "mlx_vlm":
-        model_display = mlx_repo.split("/")[-1]
-    else:
-        model_display = ollama_model
+    model_display = _caption_model_display(config)
 
     console.print(Panel.fit(
         f"[bold green]ScreenLens — Video Ingestion[/bold green]\n"
@@ -343,8 +376,10 @@ def run(
     video_path: str = typer.Argument(..., help="Path to the video file"),
     query: str = typer.Argument(..., help="Natural language search query"),
     strategy: str = typer.Option("keyframe", help="Extraction strategy: 'keyframe' or 'fixed_fps'"),
-    backend: str = typer.Option("mlx_vlm", help="Caption backend: 'mlx_vlm' or 'ollama'"),
-    mlx_repo: str = typer.Option("mlx-community/Qwen3.5-122B-A10B-bf16", help="MLX model repo"),
+    backend: str = typer.Option("omlx", help="Caption backend: 'omlx' or 'ollama'"),
+    omlx_url: str = typer.Option(DEFAULT_OMLX_URL, help="oMLX API URL or dashboard URL"),
+    omlx_model: Optional[str] = typer.Option(None, help="oMLX model ID (defaults to env or 'default')"),
+    omlx_api_key: Optional[str] = typer.Option(None, help="oMLX API key (defaults to MLX_API_KEY/OMLX_API_KEY)"),
     device: str = typer.Option("mps", help="Device for CLIP"),
 ):
     """Ingest a video AND search it in one shot."""
@@ -355,8 +390,13 @@ def run(
 
     config = ScreenLensConfig()
     config.frame_extraction.strategy = ExtractionStrategy(strategy)
-    config.captioning.backend = CaptionBackend(backend)
-    config.captioning.mlx_repo_id = mlx_repo
+    _apply_captioning_options(
+        config,
+        backend=backend,
+        omlx_url=omlx_url,
+        omlx_model=omlx_model,
+        omlx_api_key=omlx_api_key,
+    )
     config.embedding.device = device
 
     # Per-video slugged data directory (consistent with `ingest` / `batch`)
@@ -377,20 +417,25 @@ def run(
 
 @app.command()
 def summarize(
-    mlx_repo: str = typer.Option(
-        "mlx-community/Qwen3.5-122B-A10B-bf16",
-        help="HuggingFace repo ID for MLX model (same model used for captioning)"
-    ),
+    omlx_url: str = typer.Option(DEFAULT_OMLX_URL, help="oMLX API URL or dashboard URL"),
+    omlx_model: Optional[str] = typer.Option(None, help="oMLX model ID (defaults to env or 'default')"),
+    omlx_api_key: Optional[str] = typer.Option(None, help="oMLX API key (defaults to MLX_API_KEY/OMLX_API_KEY)"),
     config_file: Optional[str] = typer.Option(None, help="Path to config JSON file"),
 ):
-    """Generate a full-video summary from all ingested captions using the MLX model."""
+    """Generate a full-video summary from all ingested captions."""
     config = _load_config(config_file)
-    config.captioning.mlx_repo_id = mlx_repo
+    _apply_captioning_options(
+        config,
+        backend="omlx",
+        omlx_url=omlx_url,
+        omlx_model=omlx_model,
+        omlx_api_key=omlx_api_key,
+    )
 
-    model_display = mlx_repo.split("/")[-1]
+    model_display = _caption_model_display(config)
     console.print(Panel.fit(
         f"[bold green]ScreenLens — Video Summarization[/bold green]\n"
-        f"Model: {model_display} (via mlx-vlm)\n"
+        f"Model: {model_display}\n"
         f"Captions dir: {config.data_dir / 'captions'}",
         title="Configuration",
     ))
@@ -421,14 +466,13 @@ def batch(
     fps: float = typer.Option(1.0, help="Frames per second (only for fixed_fps strategy)"),
     max_interval: float = typer.Option(4.0, help="Max seconds between keyframes (keyframe strategy)"),
     # Captioning backend
-    backend: str = typer.Option("mlx_vlm", help="Caption backend: 'mlx_vlm' or 'ollama'"),
-    mlx_repo: str = typer.Option(
-        "mlx-community/Qwen3.5-122B-A10B-bf16",
-        help="HuggingFace repo ID for MLX vision model"
-    ),
+    backend: str = typer.Option("omlx", help="Caption backend: 'omlx' or 'ollama'"),
+    omlx_url: str = typer.Option(DEFAULT_OMLX_URL, help="oMLX API URL or dashboard URL"),
+    omlx_model: Optional[str] = typer.Option(None, help="oMLX model ID (defaults to env or 'default')"),
+    omlx_api_key: Optional[str] = typer.Option(None, help="oMLX API key (defaults to MLX_API_KEY/OMLX_API_KEY)"),
     ollama_model: str = typer.Option("llama3.2-vision", help="Ollama vision model (if backend=ollama)"),
     ollama_url: str = typer.Option("http://127.0.0.1:11434", help="Ollama API URL"),
-    batch_size: int = typer.Option(4, help="Frames per mlx-vlm batch_generate call (MLX backend only)"),
+    batch_size: int = typer.Option(4, help="Frames per captioning chunk/concurrent oMLX requests"),
     # Other
     device: str = typer.Option("mps", help="Device for CLIP: mps, cuda, cpu"),
     config_file: Optional[str] = typer.Option(None, help="Path to config JSON file"),
@@ -466,11 +510,16 @@ def batch(
         config.frame_extraction.strategy = ExtractionStrategy(strategy)
         config.frame_extraction.fps = fps
         config.frame_extraction.max_interval_seconds = max_interval
-        config.captioning.backend = CaptionBackend(backend)
-        config.captioning.mlx_repo_id = mlx_repo
-        config.captioning.ollama_model = ollama_model
-        config.captioning.ollama_base_url = ollama_url
-        config.captioning.batch_size = batch_size
+        _apply_captioning_options(
+            config,
+            backend=backend,
+            ollama_model=ollama_model,
+            ollama_url=ollama_url,
+            batch_size=batch_size,
+            omlx_url=omlx_url,
+            omlx_model=omlx_model,
+            omlx_api_key=omlx_api_key,
+        )
         config.embedding.device = device
 
         # Per-video slugged data directory (shared with `ingest` / `run`)
@@ -499,10 +548,9 @@ def batch(
 def reconstruct(
     folder: Optional[str] = typer.Argument(None, help="Specific video folder to reconstruct (e.g. existinginvestment_20260408_223036)"),
     data_dir: str = typer.Option("./data", help="Base data directory containing ingested video folders"),
-    mlx_repo: str = typer.Option(
-        "mlx-community/Qwen3.5-122B-A10B-bf16",
-        help="HuggingFace repo ID for MLX model used for reconstruction"
-    ),
+    omlx_url: str = typer.Option(DEFAULT_OMLX_URL, help="oMLX API URL or dashboard URL"),
+    omlx_model: Optional[str] = typer.Option(None, help="oMLX model ID (defaults to env or 'default')"),
+    omlx_api_key: Optional[str] = typer.Option(None, help="oMLX API key (defaults to MLX_API_KEY/OMLX_API_KEY)"),
     config_file: Optional[str] = typer.Option(None, help="Path to config JSON file"),
 ):
     """Reconstruct artifacts from ingested video captions.
@@ -551,13 +599,19 @@ def reconstruct(
         raise typer.Exit(1)
 
     config = _load_config(config_file)
-    config.captioning.mlx_repo_id = mlx_repo
+    _apply_captioning_options(
+        config,
+        backend="omlx",
+        omlx_url=omlx_url,
+        omlx_model=omlx_model,
+        omlx_api_key=omlx_api_key,
+    )
 
     console.print(Panel.fit(
         f"[bold green]ScreenLens — Artifact Reconstruction[/bold green]\n"
         f"Data dir: {base.resolve()}\n"
         f"Folders: {len(folders)}\n"
-        f"Model: {mlx_repo.split('/')[-1]}",
+        f"Model: {_caption_model_display(config)}",
         title="Reconstruction Pipeline",
     ))
 
@@ -625,10 +679,9 @@ def reconstruct(
 def assemble(
     data_dir: str = typer.Option("./data", help="Directory containing data/*/output/ artifacts"),
     output_dir: str = typer.Option("./OUTPUT", help="Where to write the assembled tree"),
-    mlx_repo: str = typer.Option(
-        "mlx-community/Qwen3.5-122B-A10B-bf16",
-        help="HuggingFace repo ID for MLX model used for inference"
-    ),
+    omlx_url: str = typer.Option(DEFAULT_OMLX_URL, help="oMLX API URL or dashboard URL"),
+    omlx_model: Optional[str] = typer.Option(None, help="oMLX model ID (defaults to env or 'default')"),
+    omlx_api_key: Optional[str] = typer.Option(None, help="oMLX API key (defaults to MLX_API_KEY/OMLX_API_KEY)"),
     mapping: Optional[str] = typer.Option(None, help="Path to a hand-edited MANIFEST.json — skips LLM inference"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Stop after corpus classification, write nothing"),
     config_file: Optional[str] = typer.Option(None, help="Path to config JSON file"),
@@ -647,13 +700,19 @@ def assemble(
     from .assemble import assemble_corpus
 
     config = _load_config(config_file)
-    config.captioning.mlx_repo_id = mlx_repo
+    _apply_captioning_options(
+        config,
+        backend="omlx",
+        omlx_url=omlx_url,
+        omlx_model=omlx_model,
+        omlx_api_key=omlx_api_key,
+    )
 
     console.print(Panel.fit(
         f"[bold green]ScreenLens — Corpus Assembly[/bold green]\n"
         f"Data dir:   {Path(data_dir).resolve()}\n"
         f"Output dir: {Path(output_dir).resolve()}\n"
-        f"Model:      {mlx_repo.split('/')[-1]}\n"
+        f"Model:      {_caption_model_display(config)}\n"
         f"Mode:       {'DRY RUN' if dry_run else 'FULL'}"
         + (f"\nMapping:    {mapping}" if mapping else ""),
         title="Assembly Pipeline",
@@ -673,6 +732,19 @@ def assemble(
     console.print(f"  Final stage: {result.get('stage', '?')}")
     if result.get("stage") == "gate_failed":
         console.print(f"  [yellow]Gate decided this is not a coding project — nothing to assemble[/yellow]")
+
+
+@app.command()
+def tui(
+    config_file: Optional[str] = typer.Argument(
+        None,
+        help="Optional JSON config file to load when the TUI starts",
+    ),
+):
+    """Launch the Textual/Rich terminal GUI."""
+    from .tui import run_tui
+
+    raise typer.Exit(run_tui(config_file))
 
 
 @app.command()

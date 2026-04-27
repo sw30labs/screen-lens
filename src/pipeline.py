@@ -3,7 +3,7 @@ LangGraph ScreenLens Pipeline.
 
 Orchestrates the full ScreenLens workflow:
   1. Ingest — extract keyframes from video (hybrid change detection)
-  2. Caption — generate dense captions (Qwen3.5-VL via mlx-vlm or Ollama)
+  2. Caption — generate dense captions (Qwen3.5-VL via oMLX or Ollama)
   3. Embed — generate CLIP embeddings for semantic search
   4. Store — persist embeddings + metadata in ChromaDB
   5. Search — semantic query (text → CLIP → vector search)
@@ -21,6 +21,7 @@ from .config import ScreenLensConfig
 from .frame_extractor import extract_frames, get_video_metadata
 from .captioner import caption_frames
 from .embedder import CLIPEmbedder
+from .omlx_client import OMLXClient, resolve_omlx_model
 from .vector_store import ScreenLensVectorStore
 
 
@@ -94,8 +95,8 @@ def caption_node(state: ScreenLensState) -> dict:
     output_dir = str(config.data_dir / "captions")
 
     backend = config.captioning.backend.value
-    if backend == "mlx_vlm":
-        model_name = config.captioning.mlx_repo_id.split("/")[-1]
+    if backend == "omlx":
+        model_name = resolve_omlx_model(config.captioning).split("/")[-1]
     else:
         model_name = config.captioning.ollama_model
 
@@ -246,33 +247,20 @@ def summarize_node(state: ScreenLensState) -> dict:
     }
 
 
-def _mlx_text_generate(model, tokenizer, system_prompt: str, user_prompt: str,
-                       max_tokens: int = 2048, temperature: float = 0.3) -> str:
-    """Generate text using mlx-vlm model (text-only, no image)."""
-    import re
-    from mlx_vlm import generate
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
-
-    prompt = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True,
-        enable_thinking=False,
+def _omlx_text_generate(
+    client: OMLXClient,
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int = 2048,
+    temperature: float = 0.3,
+) -> str:
+    """Generate text through the configured oMLX server."""
+    return client.chat(
+        system_prompt,
+        user_prompt,
+        max_tokens=max_tokens,
+        temperature=temperature,
     )
-
-    result = generate(model, tokenizer, prompt, max_tokens=max_tokens, temperature=temperature)
-
-    if isinstance(result, str):
-        raw = result
-    elif hasattr(result, "text"):
-        raw = result.text
-    else:
-        raw = str(result)
-
-    # Strip any residual <think>...</think>
-    return re.sub(r'<think>.*?</think>\s*', '', raw, flags=re.DOTALL).strip()
 
 
 def _compute_chunk_strategy(captioned: list[dict], model_context_tokens: int) -> dict:
@@ -332,7 +320,7 @@ def _compute_chunk_strategy(captioned: list[dict], model_context_tokens: int) ->
 def summarize_all_node(state: ScreenLensState) -> dict:
     """Generate a full-video summary from ALL captions (not search-based).
 
-    Uses the same mlx-vlm model (e.g. Qwen3.5-122B) for text summarization.
+    Uses the same configured model backend for text summarization.
     Dynamically computes chunk size based on model context window and caption stats.
       - If all captions fit in one call → single-pass summary
       - Otherwise → hierarchical: chunk summaries → final synthesis
@@ -356,35 +344,10 @@ def summarize_all_node(state: ScreenLensState) -> dict:
     print(f"[SUMMARIZE] Full-video summary from {len(captioned)} frames")
     print(f"{'='*60}")
 
-    # Load model — same one used for captioning
-    from mlx_vlm import load
-
-    model_id = config.captioning.mlx_model_path or config.captioning.mlx_repo_id
-    print(f"Loading model: {model_id}")
-    loaded = load(model_id, lazy=True)
-    model, tokenizer = loaded[:2]
-
-    # ── Determine model context size ─────────────────────────────────────
-    model_context = 32768  # conservative default
-    try:
-        if hasattr(model, "config"):
-            mc = model.config
-            # Try common attribute names for max context
-            for attr in ("max_position_embeddings", "max_seq_len", "seq_length",
-                         "model_max_length", "max_length"):
-                val = getattr(mc, attr, None)
-                if val and isinstance(val, int) and val > 1024:
-                    model_context = val
-                    break
-            # Also check nested text_config (common in VLMs)
-            if hasattr(mc, "text_config"):
-                for attr in ("max_position_embeddings", "max_seq_len"):
-                    val = getattr(mc.text_config, attr, None)
-                    if val and isinstance(val, int) and val > 1024:
-                        model_context = val
-                        break
-    except Exception:
-        pass
+    # Summarization uses oMLX. Ollama remains a captioning fallback.
+    model = OMLXClient(config.captioning)
+    model_context = config.captioning.omlx_model_context
+    print(f"Using oMLX model: {model.model} at {model.base_url}")
 
     # ── Compute chunking strategy ────────────────────────────────────────
     strategy = _compute_chunk_strategy(captioned, model_context)
@@ -429,7 +392,7 @@ def summarize_all_node(state: ScreenLensState) -> dict:
             f"Frame descriptions:\n\n{captions_block}"
         )
 
-        summary = _mlx_text_generate(model, tokenizer, system, user, max_tokens=4096)
+        summary = _omlx_text_generate(model, system, user, max_tokens=4096)
 
         elapsed = time.time() - t0
         print(f"\nFull-video summary generated in {elapsed:.1f}s")
@@ -472,7 +435,7 @@ def summarize_all_node(state: ScreenLensState) -> dict:
         )
         user = f"Segment {i+1} ({time_range}):\n\n{chunk_text}"
 
-        response = _mlx_text_generate(model, tokenizer, system, user)
+        response = _omlx_text_generate(model, system, user)
         chunk_summaries.append(f"**Segment {i+1} ({time_range}):** {response}")
         print(f"  Chunk {i+1}/{len(chunks)} summarized.")
 
@@ -499,7 +462,7 @@ def summarize_all_node(state: ScreenLensState) -> dict:
         f"Segment summaries:\n\n{all_chunk_summaries}"
     )
 
-    summary = _mlx_text_generate(model, tokenizer, system, user, max_tokens=4096)
+    summary = _omlx_text_generate(model, system, user, max_tokens=4096)
 
     elapsed = time.time() - t0
     print(f"\nFull-video summary generated in {elapsed:.1f}s")
