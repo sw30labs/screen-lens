@@ -27,6 +27,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 
 from .config import ScreenLensConfig
+from .omlx_client import OMLXClient, resolve_omlx_model
 # Reuse the chunk-strategy math from the summarization pipeline. It's the same
 # token-budget problem (fit a long caption stream into a fixed model context),
 # so we deliberately share the helper rather than duplicate the constants.
@@ -50,7 +51,7 @@ MAX_QA_ITERATIONS = 3
 # maximizes chunk size to minimize chunk count, which on a model with a
 # very large context window (e.g. Qwen3.5-122B at ~256k tokens) yields
 # chunks of 200+ captions. Each chunk only gets ~2k output tokens of
-# extraction notes, so oversized chunks force the model into aggressive
+# extraction notes, so oversized chunks force the client into aggressive
 # compression and lose specifics. This cap keeps extraction fidelity
 # bounded regardless of model context size.
 MAX_CAPTIONS_PER_CHUNK = 50
@@ -241,45 +242,34 @@ class ReconstructState(TypedDict, total=False):
 _MODEL_CACHE: dict = {}
 
 
-def get_mlx_model(config: ScreenLensConfig):
-    """Load MLX model once and cache for reuse across all nodes."""
-    key = config.captioning.mlx_repo_id
+def get_inference_client(config: ScreenLensConfig) -> OMLXClient:
+    """Create/cache the configured oMLX client for reuse across all nodes."""
+    key = (
+        "omlx",
+        config.captioning.omlx_base_url,
+        resolve_omlx_model(config.captioning),
+    )
     if key not in _MODEL_CACHE:
-        from mlx_vlm import load
-
-        model_id = config.captioning.mlx_model_path or config.captioning.mlx_repo_id
-        print(f"Loading MLX model: {model_id}")
-        loaded = load(model_id, lazy=True)
-        _MODEL_CACHE[key] = loaded[:2]
-        print("Model loaded.")
+        client = OMLXClient(config.captioning)
+        print(f"Using oMLX model: {client.model} at {client.base_url}")
+        _MODEL_CACHE[key] = client
     return _MODEL_CACHE[key]
 
 
-def mlx_generate(model, tokenizer, system: str, user: str,
-                   max_tokens: int = 4096, temperature: float = 0.2) -> str:
-    """Generate text using the MLX model (text-only, no image)."""
-    from mlx_vlm import generate
-
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]
-
-    prompt = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True,
-        enable_thinking=False,
+def generate_text(
+    client: OMLXClient,
+    system: str,
+    user: str,
+    max_tokens: int = 4096,
+    temperature: float = 0.2,
+) -> str:
+    """Generate text using the configured oMLX client."""
+    return client.chat(
+        system,
+        user,
+        max_tokens=max_tokens,
+        temperature=temperature,
     )
-
-    result = generate(model, tokenizer, prompt, max_tokens=max_tokens, temperature=temperature)
-
-    if isinstance(result, str):
-        raw = result
-    elif hasattr(result, "text"):
-        raw = result.text
-    else:
-        raw = str(result)
-
-    return re.sub(r'<think>.*?</think>\s*', '', raw, flags=re.DOTALL).strip()
 
 
 def parse_json_response(text: str) -> dict:
@@ -348,45 +338,20 @@ def _chunk_list(items: list, chunk_size: int) -> list[list]:
     return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
 
 
-def _get_model_context_size(model) -> int:
-    """Detect the model's maximum context window from its config.
-
-    Mirrors the introspection used by ``summarize_all_node`` in pipeline.py:
-    walks common attribute names on ``model.config`` and the nested
-    ``text_config`` (common in VLM architectures), returning the first
-    plausible value found. Falls back to 32768 if introspection fails.
-    """
-    model_context = 32768  # conservative default
-    try:
-        if hasattr(model, "config"):
-            mc = model.config
-            for attr in ("max_position_embeddings", "max_seq_len", "seq_length",
-                         "model_max_length", "max_length"):
-                val = getattr(mc, attr, None)
-                if val and isinstance(val, int) and val > 1024:
-                    model_context = val
-                    break
-            if hasattr(mc, "text_config"):
-                for attr in ("max_position_embeddings", "max_seq_len"):
-                    val = getattr(mc.text_config, attr, None)
-                    if val and isinstance(val, int) and val > 1024:
-                        model_context = val
-                        break
-    except Exception:
-        pass
-    return model_context
+def _get_model_context_size(client) -> int:
+    """Return the configured oMLX context window used for chunk planning."""
+    return client.config.omlx_model_context
 
 
 def _extract_segment_notes(
     captions: list[dict],
-    model,
-    tokenizer,
+    client,
     model_context: int,
 ) -> list[str]:
     """Pass 1 of hierarchical reconstruction: extract content notes per chunk.
 
     Uses ``_compute_chunk_strategy`` to size chunks against the model's
-    context window. Each chunk gets a single MLX call producing structured
+    context window. Each chunk gets a single oMLX call producing structured
     extraction notes (raw content, no synthesis). The result is a list of
     notes — one per chunk — that downstream synthesis passes consume.
 
@@ -418,8 +383,8 @@ def _extract_segment_notes(
             f"Frame captions covering the entire recording "
             f"({len(captions)} frames):\n\n{all_block}"
         )
-        notes = mlx_generate(
-            model, tokenizer, EXTRACT_SEGMENT_SYSTEM, user,
+        notes = generate_text(
+            client, EXTRACT_SEGMENT_SYSTEM, user,
             max_tokens=4096, temperature=0.1,
         )
         return [f"[Full recording]\n{notes}"]
@@ -443,8 +408,8 @@ def _extract_segment_notes(
             f"SEGMENT CAPTIONS:\n\n{chunk_block}"
         )
         t0 = time.time()
-        notes = mlx_generate(
-            model, tokenizer, EXTRACT_SEGMENT_SYSTEM, user,
+        notes = generate_text(
+            client, EXTRACT_SEGMENT_SYSTEM, user,
             max_tokens=2048, temperature=0.1,
         )
         elapsed = time.time() - t0
@@ -459,8 +424,7 @@ def _hierarchical_synthesize(
     notes: list[str],
     task_user_prefix: str,
     task_system_prompt: str,
-    model,
-    tokenizer,
+    client,
     model_context: int,
     max_output_tokens: int = 32768,
 ) -> str:
@@ -494,8 +458,8 @@ def _hierarchical_synthesize(
             f"across all segments to produce the final artifact.\n\n"
             f"SEGMENT NOTES:\n\n{notes_block}"
         )
-        return mlx_generate(
-            model, tokenizer, task_system_prompt, user,
+        return generate_text(
+            client, task_system_prompt, user,
             max_tokens=max_output_tokens, temperature=0.1,
         )
 
@@ -527,8 +491,8 @@ def _hierarchical_synthesize(
             f"SECTION NOTES:\n\n{group_block}"
         )
         t0 = time.time()
-        result = mlx_generate(
-            model, tokenizer, EXTRACT_SEGMENT_SYSTEM, intermediate_user,
+        result = generate_text(
+            client, EXTRACT_SEGMENT_SYSTEM, intermediate_user,
             max_tokens=2048, temperature=0.1,
         )
         intermediate_notes.append(f"[Section {i} of {len(groups)}]\n{result}")
@@ -540,7 +504,7 @@ def _hierarchical_synthesize(
     # than the inputs (capped at 2048 output tokens vs many more input tokens).
     return _hierarchical_synthesize(
         intermediate_notes, task_user_prefix, task_system_prompt,
-        model, tokenizer, model_context, max_output_tokens,
+        client, model_context, max_output_tokens,
     )
 
 
@@ -550,7 +514,7 @@ def classify_node(state: ReconstructState) -> dict:
     """Classify the content type from captions."""
     t0 = time.time()
     config = ScreenLensConfig(**state["config"])
-    model, tokenizer = get_mlx_model(config)
+    client = get_inference_client(config)
     captions = state["captions"]
 
     print(f"\n{'='*60}")
@@ -571,7 +535,7 @@ def classify_node(state: ReconstructState) -> dict:
         + "\n\n---\n\n".join(caption_texts)
     )
 
-    response = mlx_generate(model, tokenizer, CLASSIFY_SYSTEM, user_prompt,
+    response = generate_text(client, CLASSIFY_SYSTEM, user_prompt,
                               max_tokens=512, temperature=0.1)
     result = parse_json_response(response)
 
@@ -600,7 +564,7 @@ def plan_node(state: ReconstructState) -> dict:
     """Generate reconstruction plan: system prompt, task list, parallelism decision."""
     t0 = time.time()
     config = ScreenLensConfig(**state["config"])
-    model, tokenizer = get_mlx_model(config)
+    client = get_inference_client(config)
     content_type = state["content_type"]
     captions = state["captions"]
     qa_feedback = state.get("qa_feedback", "")
@@ -624,7 +588,7 @@ def plan_node(state: ReconstructState) -> dict:
         sampled = _stratified_sample(captions, 60)
         sample_block = _build_caption_block(sampled, max_chars=80000)
         file_id_prompt = f"Frame captions from a Python coding session:\n\n{sample_block}"
-        response = mlx_generate(model, tokenizer, PLAN_PYTHON_SYSTEM,
+        response = generate_text(client, PLAN_PYTHON_SYSTEM,
                                   file_id_prompt, max_tokens=1024, temperature=0.1)
         plan = parse_json_response(response)
 
@@ -721,20 +685,19 @@ def plan_node(state: ReconstructState) -> dict:
 def reconstruct_worker(state: dict) -> dict:
     """Execute a single reconstruction task via LangGraph Send for parallel fan-out.
 
-    Currently unreachable: ``route_to_workers`` always dispatches sequentially
-    because MLX inference is not reentrant on a shared cached model. Kept in
-    sync with ``reconstruct_sequential`` so that re-enabling parallel dispatch
-    (with per-worker model instances) wouldn't silently regress.
+    Currently unreachable: ``route_to_workers`` always dispatches sequentially.
+    Kept in sync with ``reconstruct_sequential`` so that re-enabling parallel
+    dispatch would not silently regress.
     """
     task = state["task"]
     config = ScreenLensConfig(**state["config"])
-    model, tokenizer = get_mlx_model(config)
+    client = get_inference_client(config)
     captions = state.get("captions", [])
     segment_notes = state.get("segment_notes") or []
-    model_context = _get_model_context_size(model)
+    model_context = _get_model_context_size(client)
 
     if not segment_notes and captions:
-        segment_notes = _extract_segment_notes(captions, model, tokenizer, model_context)
+        segment_notes = _extract_segment_notes(captions, client, model_context)
 
     task_system = task.get("system_override", state.get("system_prompt", ""))
     task_user_prefix = task["prompt"]
@@ -744,7 +707,7 @@ def reconstruct_worker(state: dict) -> dict:
 
     content = _hierarchical_synthesize(
         segment_notes, task_user_prefix, task_system,
-        model, tokenizer, model_context,
+        client, model_context,
     )
 
     elapsed = time.time() - t0
@@ -776,13 +739,13 @@ def reconstruct_sequential(state: ReconstructState) -> dict:
                any QA feedback embedded in the task user prompt.
     """
     config = ScreenLensConfig(**state["config"])
-    model, tokenizer = get_mlx_model(config)
+    client = get_inference_client(config)
     captions = state["captions"]
     tasks = state["reconstruction_tasks"]
     system_prompt = state.get("system_prompt", "")
     qa_iteration = state.get("qa_iteration", 0)
 
-    model_context = _get_model_context_size(model)
+    model_context = _get_model_context_size(client)
     print(f"\n  Processing {len(tasks)} task(s) sequentially "
           f"(model context: {model_context:,} tokens)")
 
@@ -794,7 +757,7 @@ def reconstruct_sequential(state: ReconstructState) -> dict:
         print(f"  [Pass 1] Extracting segment notes from {len(captions)} captions...")
         t1 = time.time()
         segment_notes = _extract_segment_notes(
-            captions, model, tokenizer, model_context,
+            captions, client, model_context,
         )
         print(f"  [Pass 1] Produced {len(segment_notes)} segment notes "
               f"in {time.time() - t1:.1f}s")
@@ -813,7 +776,7 @@ def reconstruct_sequential(state: ReconstructState) -> dict:
 
         content = _hierarchical_synthesize(
             segment_notes, task_user_prefix, task_system,
-            model, tokenizer, model_context,
+            client, model_context,
         )
 
         elapsed = time.time() - t0
@@ -838,7 +801,7 @@ def qa_reflect_node(state: ReconstructState) -> dict:
     """Quality-check artifacts using a reflection agent. Routes to retry or save."""
     t0 = time.time()
     config = ScreenLensConfig(**state["config"])
-    model, tokenizer = get_mlx_model(config)
+    client = get_inference_client(config)
     qa_iteration = state.get("qa_iteration", 0)
     captions = state["captions"]
 
@@ -886,7 +849,7 @@ def qa_reflect_node(state: ReconstructState) -> dict:
         f"RECONSTRUCTED ARTIFACTS:\n{artifacts_text}"
     )
 
-    response = mlx_generate(model, tokenizer, QA_REFLECT_SYSTEM, user_prompt,
+    response = generate_text(client, QA_REFLECT_SYSTEM, user_prompt,
                               max_tokens=1024, temperature=0.1)
     result = parse_json_response(response)
 
@@ -992,12 +955,9 @@ def save_node(state: ReconstructState) -> dict:
 def route_to_workers(state: ReconstructState):
     """Dispatch reconstruction tasks sequentially.
 
-    The pipeline shares a single cached MLX model across all workers
-    (see ``_MODEL_CACHE``). MLX inference is not reentrant on a shared
-    model object, so parallel ``Send`` fan-out segfaults during concurrent
-    prefill. Since MLX is compute-bound and there's only one model in
-    memory, parallel dispatch never offered a real speedup either —
-    sequential is the only correct path here.
+    Keep reconstruction deterministic by processing tasks in order. The
+    expensive work is delegated to the oMLX server, which handles its own
+    scheduling and batching.
     """
     tasks = state.get("reconstruction_tasks", [])
     print(f"\n  Sequential execution ({len(tasks)} task(s))")

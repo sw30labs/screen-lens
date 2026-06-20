@@ -19,14 +19,12 @@ dependencies = [
     "typer>=0.12",
     "rich>=13.0",
     "pydantic>=2.0",
-    # MLX-VLM for Qwen3.5 vision (Apple Silicon)
-    "mlx-vlm>=0.4",
-    "huggingface-hub>=0.25",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "pyyaml>=6.0"]
-ollama-only = []  # No mlx-vlm needed if using Ollama backend exclusively
+tui = ["textual>=0.80"]
+all = ["textual>=0.80"]
 
 [project.scripts]
 screenlens = "src.cli:app"

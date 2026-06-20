@@ -8,7 +8,7 @@
 [![Assisted by Claude](https://img.shields.io/badge/Assisted_by-Claude-blueviolet?logo=anthropic&logoColor=white)](https://anthropic.com)
 [![License](https://img.shields.io/badge/License-Apache_2.0-green.svg)](LICENSE)
 
-Local video scene intelligence for Apple Silicon. Processes screen recordings through a LangGraph-orchestrated pipeline: smart keyframe extraction, Qwen3.5-VL captioning via MLX, CLIP embedding, vector search, and LLM-powered summarization — all running on your machine with no cloud dependencies. Inspired by NVIDIA VSS, rebuilt from scratch for Apple Silicon.
+Local video scene intelligence for Apple Silicon. Processes screen recordings through a LangGraph-orchestrated pipeline: smart keyframe extraction, Qwen3.5-VL captioning via oMLX, CLIP embedding, vector search, and LLM-powered summarization — all running on your machine with no cloud dependencies. Inspired by NVIDIA VSS, rebuilt from scratch for Apple Silicon.
 
 ## Demo
 
@@ -19,22 +19,20 @@ Local video scene intelligence for Apple Silicon. Processes screen recordings th
 ```mermaid
 graph TD
     A[Video Input<br/>.mov / .mp4] --> B[Hybrid Keyframe Detection<br/>SSIM + pHash + HSV histogram]
-    B --> C[Vision Captioning<br/>Qwen3.5-VL via mlx-vlm]
-    C --> D[CLIP Embedding<br/>OpenCLIP ViT-B-32]
-    D --> E[Vector Store<br/>ChromaDB]
-
-    F[Natural Language Query] --> G[CLIP Text Encoder]
-    G --> H[Semantic Search<br/>ChromaDB cosine]
-    E --> H
-    H --> I[LLM Summarization<br/>Ollama llama3.2]
-    I --> J[Answer + Timestamps]
+    B --> C[Vision Captioning<br/>Qwen3.5-VL via oMLX]
+    C --> D[Caption Archive<br/>frames + timestamps + descriptions]
+    D --> E[Content Classification<br/>code / docs / PDF / GUI demo]
+    E --> F[Reconstruction Plan<br/>files, sections, tasks]
+    F --> G[Hierarchical Reconstruction<br/>oMLX agents]
+    G --> H[QA Reflection<br/>retry when incomplete]
+    H --> I[Reconstructed Artifacts<br/>data/*/output]
 
     style A fill:#4a90d9,color:#fff
     style B fill:#8e44ad,color:#fff
     style C fill:#e74c3c,color:#fff
     style E fill:#2ecc71,color:#fff
-    style F fill:#e67e22,color:#fff
-    style J fill:#27ae60,color:#fff
+    style G fill:#e67e22,color:#fff
+    style I fill:#27ae60,color:#fff
 ```
 
 ## Pipeline Flow (LangGraph)
@@ -44,13 +42,12 @@ stateDiagram-v2
     [*] --> Ingest: video_path
     Ingest --> Caption: keyframes extracted
     Caption --> Embed: captions generated
-    Embed --> [*]: stored in ChromaDB
-
-    state "Search Pipeline" as search {
-        [*] --> Search: query text
-        Search --> Summarize: top-k results
-        Summarize --> [*]: answer + timestamps
-    }
+    Embed --> Classify: ingested folder
+    Classify --> Plan: content type
+    Plan --> Reconstruct: reconstruction tasks
+    Reconstruct --> QA: draft artifacts
+    QA --> Save: accepted or retried
+    Save --> [*]: output files
 ```
 
 ## Component Overview
@@ -58,12 +55,11 @@ stateDiagram-v2
 | Component | Technology | Purpose |
 |-----------|-----------|---------|
 | Frame Extraction | **Hybrid keyframe detection** (SSIM + pHash + HSV) | Only captures distinct screens — skips duplicates |
-| Vision Captioning | **Qwen3.5-VL** via mlx-vlm (Apple Silicon native) | Dense, high-fidelity frame descriptions, batched via `mlx_vlm.batch_generate` (default 4 frames/call) |
+| Vision Captioning | **Qwen3.5-VL** via oMLX (Apple Silicon native) | Dense, high-fidelity frame descriptions through oMLX's OpenAI-compatible VLM API |
 | Fallback Captioning | Ollama (llama3.2-vision) | Cross-platform alternative |
 | Visual Embeddings | OpenCLIP ViT-B-32 | Semantic vector representations |
-| Vector Storage | ChromaDB | Persistent similarity search |
-| Text Search | CLIP text encoder | Query → embedding |
-| Summarization | Ollama (llama3.2) | Natural language answers |
+| Vector Storage | ChromaDB | Optional inspection index for ingested frames |
+| Reconstruction | LangGraph + oMLX | Classify recordings and rebuild source/docs/demo references |
 | Orchestration | LangGraph StateGraph | Pipeline state management |
 | CLI | Typer + Rich | User interface |
 
@@ -72,6 +68,8 @@ stateDiagram-v2
 - **Hardware**: Apple Silicon Mac (M1+). Optimized for M3 Ultra with 512GB unified memory.
 - **Python 3.11+**
 - **ffmpeg**: `brew install ffmpeg`
+- **oMLX**: Start the local OpenAI-compatible server on `http://127.0.0.1:8000/v1`.
+- **oMLX API key**: Set `MLX_API_KEY` or `OMLX_API_KEY` if authentication is enabled. ScreenLens loads `.env` automatically, and shell exports take precedence.
 - **Ollama** (for summarization): Install from [ollama.com](https://ollama.com) and pull:
 
 ```bash
@@ -79,7 +77,7 @@ ollama pull llama3.2           # Text model for summarization
 ollama pull llama3.2-vision    # Only needed if using --backend ollama for captioning
 ```
 
-The Qwen3.5-VL MLX model downloads automatically on first use (~20GB for 4-bit).
+oMLX can reuse existing MLX-format model directories and exposes models through `/v1/models`. `MLX_MODEL`, `OMLX_MODEL`, or `--omlx-model` can select the served model; otherwise ScreenLens uses `default`. Captioning requires a vision-capable model; text-only models such as DeepSeek V3/V4/R1 and GPT-OSS cannot process frames.
 
 ## Installation
 
@@ -88,15 +86,23 @@ cd screenlens
 pip install -e .
 ```
 
-## Usage
-
-### 1. Ingest a Video (recommended — Qwen3.5 + keyframes)
+The terminal GUI is optional:
 
 ```bash
+pip install -e ".[tui]"
+```
+
+## Usage
+
+### 1. Ingest a Video (recommended — oMLX + keyframes)
+
+```bash
+cp .env.example .env
+# Edit .env with your oMLX key and model, or export these variables in your shell.
 python -m src.cli ingest "Screen Recording 2026-04-04 at 8.33.55 AM.mov"
 ```
 
-This uses smart keyframe detection (only captures when the screen actually changes) and Qwen3.5-122B-A10B via MLX for high-fidelity captions.
+This uses smart keyframe detection (only captures when the screen actually changes) and the configured oMLX VLM for high-fidelity captions. Dashboard URLs such as `http://127.0.0.1:8000/admin/dashboard` are normalized to `http://127.0.0.1:8000/v1`.
 
 ### 2. Ingest with Ollama (alternative)
 
@@ -104,19 +110,17 @@ This uses smart keyframe detection (only captures when the screen actually chang
 python -m src.cli ingest "video.mov" --backend ollama --strategy fixed_fps --fps 1.0
 ```
 
-### 3. Use a smaller Qwen3.5 model
+### 3. Use a Specific oMLX Model
 
 ```bash
-python -m src.cli ingest "video.mov" --mlx-repo mlx-community/Qwen3.5-35B-A3B-4bit
+python -m src.cli ingest "video.mov" --omlx-model mlx-community/Qwen3.5-35B-A3B-4bit
 ```
 
-Captioning runs in batches of 4 frames per `mlx_vlm.batch_generate` call by default. To override:
+Captioning submits up to 4 concurrent oMLX requests per chunk by default. To override:
 
 ```bash
 python -m src.cli ingest "video.mov" --batch-size 8
 ```
-
-The default of 4 was empirically tuned on M3 Ultra 512GB with the 122B model — see the [Performance Notes](#performance-notes) section. If you switch to a smaller model, re-run `scripts/bench_caption_batch.py` to find the new optimum.
 
 ### 4. Batch-Ingest a Folder of Videos
 
@@ -126,21 +130,7 @@ python -m src.cli batch "/path/to/recordings/"
 
 Each video gets its own data directory under `./data/<video_name>/` with separate frames, captions, embeddings, and ChromaDB collections.
 
-### 5. Search the Video
-
-```bash
-python -m src.cli search "What application is being demonstrated?"
-python -m src.cli search "Show me any error messages or warnings"
-python -m src.cli search "What buttons or menus are visible?"
-```
-
-### 6. One-Shot (Ingest + Search)
-
-```bash
-python -m src.cli run "video.mov" "Summarize what happens in this screen recording"
-```
-
-### 7. Reconstruct Artifacts from Recordings
+### 5. Reconstruct Artifacts from Recordings
 
 ```bash
 python -m src.cli reconstruct
@@ -153,11 +143,19 @@ Scans all folders in `./data/`, classifies each recording (Python code, Markdown
 - **Reflection QA** — Up to 3 iterations of quality review before saving
 - **Output** — Reconstructed files saved to `./data/<video_name>/output/`
 
-### 8. Check Status
+### 6. Check Status
 
 ```bash
 python -m src.cli info
 ```
+
+### 7. Launch the Terminal GUI
+
+```bash
+python -m src.cli tui
+```
+
+The Textual/Rich GUI provides inputs for video paths, data/output directories, and oMLX model selection. Use `Ingest + Reconstruct` for the main workflow: ingest the video, classify what it shows, and reconstruct the matching output from the new ingested folder.
 
 ## Keyframe Detection
 
@@ -181,21 +179,19 @@ All settings live in `src/config.py` (Pydantic models). Key parameters:
 |-----------|---------|-------------|
 | `frame_extraction.strategy` | keyframe | `keyframe` (smart) or `fixed_fps` |
 | `frame_extraction.max_interval_seconds` | 4.0 | Max gap between keyframes |
-| `captioning.backend` | mlx_vlm | `mlx_vlm` (Qwen3.5) or `ollama` |
-| `captioning.mlx_repo_id` | Qwen3.5-122B-A10B-bf16 | HuggingFace MLX model (override with `--mlx-repo`) |
-| `captioning.batch_size` | 4 | Frames per `mlx_vlm.batch_generate` call (MLX backend only) |
+| `captioning.backend` | omlx | `omlx` or `ollama` |
+| `captioning.omlx_base_url` | http://127.0.0.1:8000/v1 | oMLX OpenAI-compatible API URL; dashboard/root URLs are normalized |
+| `captioning.omlx_model` | null | oMLX model ID; falls back to `MLX_MODEL`/`OMLX_MODEL`/`LLM_MODEL` env vars or `default` |
+| `captioning.batch_size` | 4 | Concurrent oMLX caption requests per chunk |
 | `captioning.max_tokens` | 1024 | Max tokens per caption |
 | `embedding.model_name` | ViT-B-32 | CLIP model |
 | `embedding.device` | mps | Apple Silicon GPU |
-| `search.top_k` | 10 | Results per query |
 
 ## Performance Notes
 
-Captioning is parallelized via `mlx_vlm.batch_generate`, which packs multiple frames into a single forward pass with a shared KV cache and zero-padding within same-shape image groups. The default `batch_size=4` was empirically tuned on M3 Ultra 512GB with `Qwen3.5-122B-A10B-bf16`: it gives a real ~1.5× aggregate throughput improvement over `batch_size=1`, while `batch_size=8` regresses (likely MoE expert dispersion at higher batch sizes). Memory was not the constraint — peak GPU usage stayed under 270 GB out of 512 GB at every tested batch size.
+The default oMLX backend sends each caption as an OpenAI-compatible vision request and lets oMLX handle scheduling, continuous batching, and KV caching server-side. `captioning.batch_size` controls how many frame requests ScreenLens submits concurrently per chunk.
 
-On Apple Silicon with large vision inputs, **prefill (vision encoder + prompt) dominates per-frame time, not decode**. This means that the main lever for further wall-clock improvement is *not* a larger batch size — it's a smaller model (e.g. `Qwen3.5-35B-A3B-4bit`) or a smaller `frame_extraction.max_dimension`. Re-run `scripts/bench_caption_batch.py` whenever you change the model to find the new optimum.
-
-The captioner installs a module-level monkey-patch on `mlx_vlm.generate.apply_chat_template` to inject `enable_thinking=False`. This is required because Qwen3.5-VL's chat template prepends `<think>` to the assistant turn, and `mlx_vlm.batch_generate` does not forward kwargs to `apply_chat_template`, so without the patch ~50% of every caption's token budget gets burned on planning prose before the structured response. The patch is idempotent and a no-op for non-Qwen models.
+On Apple Silicon with large vision inputs, **prefill (vision encoder + prompt) dominates per-frame time, not decode**. The main levers for wall-clock improvement are a smaller VLM, a smaller `frame_extraction.max_dimension`, and an oMLX concurrency value that matches the host.
 
 ## Project Structure
 
@@ -203,14 +199,13 @@ The captioner installs a module-level monkey-patch on `mlx_vlm.generate.apply_ch
 src/
   config.py          # Pydantic configuration (extraction, captioning, embedding, search)
   frame_extractor.py # Hybrid keyframe detection + fixed FPS fallback
-  captioner.py       # Dual backend: mlx-vlm (Qwen3.5) + Ollama; batched via batch_generate
+  captioner.py       # Backends: oMLX (default) and Ollama
   embedder.py        # CLIP embedding via OpenCLIP
   vector_store.py    # ChromaDB storage + search
   pipeline.py        # LangGraph StateGraph orchestration (ingest/search/summarize)
   reconstruct.py     # LangGraph deep agents — artifact reconstruction with QA reflection
   cli.py             # Typer CLI interface
-scripts/
-  bench_caption_batch.py  # MLX-VLM batch-size sweep + frames/sec & peak-memory plot
+  tui.py             # Optional Textual/Rich terminal GUI
 data/
   frames/            # Extracted keyframe images
   captions/          # JSON caption files
@@ -225,7 +220,7 @@ tests/
 | Feature | NVIDIA VSS | ScreenLens |
 |---------|-----------|-----------|
 | Frame extraction | Custom + TensorRT | Hybrid keyframe detection (SSIM/pHash/HSV) |
-| Vision model | NVIDIA VILA | **Qwen3.5-VL** via mlx-vlm |
+| Vision model | NVIDIA VILA | **Qwen3.5-VL** via oMLX |
 | Embeddings | TensorRT Visual Encoder | OpenCLIP ViT-B-32 |
 | Vector DB | Milvus | ChromaDB |
 | LLM | Llama 3.1 70B (NIM) | Ollama (configurable) |
