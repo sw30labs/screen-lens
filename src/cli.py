@@ -735,6 +735,113 @@ def assemble(
 
 
 @app.command()
+def transcribe(
+    video_path: str = typer.Argument(..., help="Path to the screen recording (.mov, .mp4, ...)"),
+    ocr_model: Optional[str] = typer.Option(None, help="Vision OCR model id (default: env OCR_MODEL or recommended olmOCR-2)"),
+    llm_model: Optional[str] = typer.Option(None, help="Text LLM for seam/indent cleanup (default: env LLM_MODEL)"),
+    omlx_url: str = typer.Option(DEFAULT_OMLX_URL, help="oMLX API URL or dashboard URL"),
+    omlx_api_key: Optional[str] = typer.Option(None, help="oMLX API key (default: MLX_API_KEY/OMLX_API_KEY)"),
+    sample_fps: float = typer.Option(2.0, help="Frames/sec to sample before dedup"),
+    no_cleanup: bool = typer.Option(False, "--no-cleanup", help="Skip the LLM seam/indent cleanup pass"),
+    deterministic: bool = typer.Option(False, "--deterministic", help="Also run Apple Vision backstop (best for code)"),
+    config_file: Optional[str] = typer.Option(None, help="Path to config JSON file"),
+):
+    """Verbatim transcription: faithfully reconstruct the text/code shown in a recording.
+
+    Pipeline: scroll-safe frame selection → vision OCR → text-space stitch →
+    LLM seam/indent cleanup. Output is written to ./data/<slug>/output/transcript.md.
+    """
+    from .transcribe import transcribe_video
+    from .omlx_client import normalize_omlx_base_url
+
+    video = Path(video_path)
+    if not video.exists():
+        console.print(f"[red]Error: Video file not found: {video_path}[/red]")
+        raise typer.Exit(1)
+
+    config = _load_config(config_file)
+    base = normalize_omlx_base_url(omlx_url)
+    config.ocr.base_url = base
+    config.reconstruction.base_url = base
+    if ocr_model is not None:
+        config.ocr.model = ocr_model
+    if llm_model is not None:
+        config.reconstruction.model = llm_model
+    if omlx_api_key is not None:
+        config.ocr.api_key = omlx_api_key
+        config.reconstruction.api_key = omlx_api_key
+    config.frame_selection.sample_fps = sample_fps
+    config.reconstruction.enabled = not no_cleanup
+    config.ocr.deterministic_backstop = deterministic
+
+    slug = _apply_video_slug(config, video)
+
+    from .omlx_client import resolve_ocr_model, resolve_llm_model
+    console.print(Panel.fit(
+        f"[bold green]ScreenLens — Verbatim Transcription[/bold green]\n"
+        f"Video: {video.name} ({video.stat().st_size / (1024**2):.0f} MB)\n"
+        f"Output: {config.data_dir}/output/transcript.md\n"
+        f"OCR (vision): {resolve_ocr_model(config.ocr)}\n"
+        f"Cleanup (text): {resolve_llm_model(config.reconstruction) if not no_cleanup else 'disabled'}\n"
+        f"Sample: {sample_fps} fps | Deterministic backstop: {deterministic}",
+        title="Configuration",
+    ))
+
+    t0 = time.time()
+    try:
+        result = transcribe_video(str(video.resolve()), config, config.data_dir)
+    except RuntimeError as exc:
+        console.print(f"\n[red]Transcription aborted:[/red] {exc}")
+        raise typer.Exit(1)
+    elapsed = time.time() - t0
+
+    if result.get("error"):
+        console.print(f"[red]Error: {result['error']}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"\n[bold green]Done in {elapsed:.1f}s[/bold green]")
+    table = Table(title="Transcription Summary")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value")
+    table.add_row("Frames selected", str(result.get("frames_selected", "?")))
+    table.add_row("Frames with text", str(result.get("frames_with_text", "?")))
+    table.add_row("OCR model", result.get("ocr_model", "?"))
+    table.add_row("Transcript", result.get("transcript_path", "?"))
+    console.print(table)
+
+
+@app.command()
+def models(
+    omlx_url: str = typer.Option(DEFAULT_OMLX_URL, help="oMLX API URL or dashboard URL"),
+    omlx_api_key: Optional[str] = typer.Option(None, help="oMLX API key (default: MLX_API_KEY/OMLX_API_KEY)"),
+):
+    """List models served by oMLX and flag which can do OCR (vision)."""
+    from .omlx_client import list_models, is_known_text_only_model, _env_value, _KNOWN_VISION_MARKERS
+
+    key = omlx_api_key or _env_value("MLX_API_KEY", "OMLX_API_KEY", ignore_placeholders=True)
+    try:
+        ids = list_models(omlx_url, key)
+    except Exception as exc:
+        console.print(f"[red]Could not reach oMLX: {exc}[/red]")
+        raise typer.Exit(1)
+
+    table = Table(title=f"oMLX models ({len(ids)})")
+    table.add_column("Model id", style="cyan")
+    table.add_column("OCR-capable?", justify="center")
+    for mid in sorted(ids):
+        low = mid.lower()
+        if is_known_text_only_model(mid):
+            cap = "[red]no (text-only)[/red]"
+        elif any(m in low for m in _KNOWN_VISION_MARKERS) or "ocr" in low:
+            cap = "[green]yes (vision)[/green]"
+        else:
+            cap = "[yellow]unknown[/yellow]"
+        table.add_row(mid, cap)
+    console.print(table)
+    console.print("[dim]Use a vision model for `transcribe --ocr-model`; a text model is fine for cleanup.[/dim]")
+
+
+@app.command()
 def tui(
     config_file: Optional[str] = typer.Argument(
         None,

@@ -27,6 +27,8 @@ _OMLX_KEY_PLACEHOLDERS = {
     "your-omlx-api-key",
     "your-omlx-api-key-here",
 }
+# Known text-only families. A vision marker (below) always overrides — so e.g.
+# "MiniMax-VL" is still treated as vision even though "minimax" is listed here.
 _KNOWN_TEXT_ONLY_PATTERNS = (
     "deepseek-chat",
     "deepseek-coder",
@@ -35,8 +37,37 @@ _KNOWN_TEXT_ONLY_PATTERNS = (
     "deepseek-v3",
     "deepseek-v4",
     "gpt-oss",
+    "minimax-m1",
+    "minimax-m2",
+    "minimax-m3",
+    "minimax-text",
+    "kimi-k2",
+    "nemotron",
+    "glm-5-1",
 )
 _KNOWN_VISION_MARKERS = ("vl", "vision", "omni", "janus")
+# Unified/multimodal model families whose names DON'T contain a vision marker
+# but which do accept image input (verified June 2026). Matched on the
+# normalized id (non-alphanumerics → '-'). VL/vision markers above still win.
+_KNOWN_VISION_PATTERNS = (
+    "gemma-4", "gemma-3",          # Gemma 3/4 are natively multimodal (OCR/doc/screen)
+    "qwen3-6", "qwen3-5",          # Qwen3.5/3.6 are unified multimodal
+    "qwen2-5-vl", "qwen3-vl",
+    "pixtral", "internvl", "minicpm-v", "llava", "molmo", "kimi-vl",
+)
+# Draft/speculative-decode helpers — not standalone OCR models. "mtp" only
+# counts as a standalone token (so "MTPLX-Optimized" — a real served model — is
+# NOT flagged), via is_draft_model().
+_DRAFT_MARKERS = ("dflash", "draft", "eagle")
+_DRAFT_RE = re.compile(r"(^|-)mtp(-|$)")
+
+
+def is_draft_model(model_id: str | None) -> bool:
+    """True for speculative-decode draft models (not usable standalone)."""
+    if not model_id:
+        return False
+    n = normalized_model_id(model_id)
+    return any(m in n for m in _DRAFT_MARKERS) or bool(_DRAFT_RE.search(n))
 
 
 def _load_dotenv_if_present() -> None:
@@ -122,13 +153,73 @@ def resolve_omlx_model(config: CaptioningConfig) -> str:
     )
 
 
+# Default OCR (vision) model. Prefer whatever vision model is already served by
+# your oMLX; override via OCR_MODEL env or ocr.model. Qwen3.x and Gemma-3/4 are
+# unified multimodal and strong at dense-text/screen OCR.
+RECOMMENDED_OCR_MODEL = "Qwen3.6-27B-bf16"
+
+
+def resolve_ocr_model(config) -> str:
+    """Resolve the OCR (vision) model id from an OCRConfig-like object."""
+    return (
+        getattr(config, "model", None)
+        or _env_value("OCR_MODEL", "MLX_VISION_MODEL", "MLX_OCR_MODEL")
+        or RECOMMENDED_OCR_MODEL
+    )
+
+
+def resolve_llm_model(config) -> str:
+    """Resolve the text-LLM id from a ReconstructionConfig-like object."""
+    return (
+        getattr(config, "model", None)
+        or _env_value("LLM_MODEL", "MLX_MODEL", "OMLX_MODEL")
+        or "default"
+    )
+
+
+def list_models(base_url: str, api_key: str | None = None, timeout: float = 30.0) -> list[str]:
+    """Return served model ids from the oMLX ``/v1/models`` endpoint."""
+    base = normalize_omlx_base_url(base_url)
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = request.Request(f"{base}/models", headers=headers, method="GET")
+    try:
+        with request.urlopen(req, timeout=timeout) as resp:
+            data = json.load(resp)
+    except (HTTPError, URLError) as exc:  # pragma: no cover - network
+        raise RuntimeError(f"Could not list oMLX models at {base}/models: {exc}") from exc
+    items = data.get("data") or data.get("models") or []
+    out = []
+    for it in items:
+        if isinstance(it, dict):
+            out.append(it.get("id") or it.get("name") or "")
+        else:
+            out.append(str(it))
+    return [m for m in out if m]
+
+
+def normalized_model_id(model_id: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", model_id.lower())
+
+
+def is_known_vision_model(model_id: str | None) -> bool:
+    """Return True if the id is a known vision/multimodal model."""
+    if not model_id:
+        return False
+    n = normalized_model_id(model_id)
+    if any(m in n for m in _KNOWN_VISION_MARKERS) or "ocr" in n:
+        return True
+    return any(p in n for p in _KNOWN_VISION_PATTERNS)
+
+
 def is_known_text_only_model(model_id: str | None) -> bool:
     """Return True for served model ids that are known not to accept images."""
     if not model_id:
         return False
-    normalized = re.sub(r"[^a-z0-9]+", "-", model_id.lower())
-    if any(marker in normalized for marker in _KNOWN_VISION_MARKERS):
+    if is_known_vision_model(model_id):
         return False
+    normalized = normalized_model_id(model_id)
     return any(pattern in normalized for pattern in _KNOWN_TEXT_ONLY_PATTERNS)
 
 
@@ -189,6 +280,46 @@ class OMLXClient:
         self.model = resolve_omlx_model(config)
         self.api_key = resolve_omlx_api_key(config)
         self.timeout = config.omlx_timeout_seconds
+        self._default_max_tokens = config.max_tokens
+        self._default_temperature = config.temperature
+
+    @classmethod
+    def from_endpoint(
+        cls,
+        *,
+        base_url: str,
+        model: str,
+        api_key: str | None,
+        timeout: float = 600.0,
+        default_max_tokens: int = 4096,
+        default_temperature: float = 0.0,
+    ) -> "OMLXClient":
+        """Build a client directly from endpoint params (no CaptioningConfig).
+
+        Used by the verbatim OCR pass (vision model) and the reconstruction pass
+        (text model), which keep their own config objects.
+        """
+        self = cls.__new__(cls)
+        self.config = None
+        self.base_url = normalize_omlx_base_url(base_url)
+        self.model = model
+        self.api_key = api_key
+        self.timeout = timeout
+        self._default_max_tokens = default_max_tokens
+        self._default_temperature = default_temperature
+        return self
+
+    def model_supports_vision(self) -> bool | None:
+        """Best-effort: is this client's model vision-capable?
+
+        Returns True/False from the name heuristic, or None if unknown. Used to
+        fail loudly before sending images to a text-only model.
+        """
+        if is_known_text_only_model(self.model):
+            return False
+        if is_known_vision_model(self.model):
+            return True
+        return None
 
     def chat(
         self,
@@ -198,6 +329,7 @@ class OMLXClient:
         images: list[str] | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> str:
         if images:
             validate_omlx_vision_model(self.model)
@@ -218,10 +350,14 @@ class OMLXClient:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
             ],
-            "max_tokens": max_tokens if max_tokens is not None else self.config.max_tokens,
-            "temperature": temperature if temperature is not None else self.config.temperature,
+            "max_tokens": max_tokens if max_tokens is not None else self._default_max_tokens,
+            "temperature": temperature if temperature is not None else self._default_temperature,
             "stream": False,
         }
+        # Pass-through sampler controls (repetition_penalty, no_repeat_ngram_size,
+        # etc.). Unknown keys are ignored by most OpenAI-compatible MLX servers.
+        if extra:
+            payload.update({k: v for k, v in extra.items() if v is not None})
         return strip_thinking(self._post_chat(payload))
 
     def _post_chat(self, payload: dict[str, Any]) -> str:

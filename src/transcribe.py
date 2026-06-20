@@ -1,0 +1,153 @@
+"""
+Verbatim transcription pipeline (the new primary path).
+
+    video.mov
+      → select_frames    (dense sample, drop static dupes)        frame_select.py
+      → VerbatimOCR       (vision model, char-faithful)            ocr.py
+      → stitch_frames     (text-space dedup of scroll overlap)     stitch.py
+      → LLM cleanup       (seams + indentation ONLY, optional)     this file
+      → output/transcript.md
+
+Everything is local: vision OCR + text cleanup both go through the oMLX
+OpenAI-compatible server. The two models are intentionally separate — a vision
+model reads the pixels, a text model tidies seams.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import time
+from pathlib import Path
+
+from .config import ScreenLensConfig
+from .frame_select import select_frames
+from .ocr import VerbatimOCR
+from .omlx_client import OMLXClient, normalize_omlx_base_url, resolve_llm_model, _env_value
+from .stitch import stitch_frames
+
+logger = logging.getLogger("screenlens.transcribe")
+
+
+CLEANUP_SYSTEM = (
+    "You repair a transcript that was OCR'd frame-by-frame from a scrolling "
+    "screen recording and then stitched together. Your edits are STRICTLY "
+    "limited:\n"
+    "1. Fix obvious stitch seams: remove a duplicated line where two frames "
+    "overlapped, or rejoin a line that was split across the overlap.\n"
+    "2. Restore consistent indentation for code blocks.\n"
+    "3. Remove stray page headers/footers that slipped through (e.g. 'Page 3 of "
+    "16', running titles).\n\n"
+    "You must NOT paraphrase, summarize, translate, complete, or 'improve' any "
+    "content. Do not invent text. Do not add commentary. If a word is garbled "
+    "and you cannot be certain, leave it exactly as-is. Output ONLY the repaired "
+    "transcript."
+)
+
+
+def _llm_client(cfg) -> OMLXClient:
+    rc = cfg.reconstruction
+    api_key = rc.api_key or _env_value("LLM_API_KEY", "MLX_API_KEY", "OMLX_API_KEY",
+                                       ignore_placeholders=True)
+    return OMLXClient.from_endpoint(
+        base_url=normalize_omlx_base_url(rc.base_url),
+        model=resolve_llm_model(rc),
+        api_key=api_key,
+        timeout=rc.timeout_seconds,
+        default_max_tokens=rc.max_tokens,
+        default_temperature=rc.temperature,
+    )
+
+
+def _cleanup_transcript(text: str, cfg) -> str:
+    """LLM seam/indent cleanup, chunked by blank-line boundaries to fit context."""
+    client = _llm_client(cfg)
+    budget_chars = int(cfg.reconstruction.model_context * 0.5) * 4  # ~half ctx, chars≈tokens*4
+    paras = text.split("\n\n")
+    chunks, cur, cur_len = [], [], 0
+    for p in paras:
+        if cur and cur_len + len(p) > budget_chars:
+            chunks.append("\n\n".join(cur)); cur, cur_len = [], 0
+        cur.append(p); cur_len += len(p) + 2
+    if cur:
+        chunks.append("\n\n".join(cur))
+
+    out = []
+    for i, ch in enumerate(chunks):
+        logger.info("LLM cleanup chunk %d/%d", i + 1, len(chunks))
+        repaired = client.chat(
+            CLEANUP_SYSTEM,
+            "Repair this stitched transcript segment. Output only the repaired text:\n\n" + ch,
+            max_tokens=cfg.reconstruction.max_tokens,
+            temperature=0.0,
+        )
+        out.append(repaired.strip())
+    return "\n\n".join(out).strip() + "\n"
+
+
+def transcribe_video(video_path: str, config: ScreenLensConfig, data_dir: Path) -> dict:
+    """Run the full verbatim pipeline for one video. Returns a result dict."""
+    t0 = time.time()
+    data_dir = Path(data_dir)
+    frames_dir = data_dir / "frames"
+    ocr_dir = data_dir / "ocr"
+    out_dir = data_dir / "output"
+    for d in (frames_dir, ocr_dir, out_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    # 1. Select frames (scroll-safe) ─────────────────────────────────────────
+    frames = select_frames(video_path, str(frames_dir), config.frame_selection)
+    if not frames:
+        return {"error": "No frames extracted", "stage": "select"}
+    logger.info("Selected %d frames", len(frames))
+
+    # 2. Verbatim OCR (vision model) ─────────────────────────────────────────
+    ocr = VerbatimOCR(config.ocr)
+    paths = [f["path"] for f in frames]
+    texts = ocr.ocr_frames(paths)  # raises loudly if the model is blind
+
+    ocr_records = []
+    for f, txt in zip(frames, texts):
+        rec = {**f, "ocr": txt}
+        ocr_records.append(rec)
+        (ocr_dir / f"ocr_{f['frame_id']:06d}.json").write_text(
+            json.dumps(rec, indent=2), encoding="utf-8")
+    (ocr_dir / "all_ocr.json").write_text(json.dumps(ocr_records, indent=2), encoding="utf-8")
+
+    non_empty = sum(1 for t in texts if t.strip())
+    logger.info("OCR done: %d/%d frames had text", non_empty, len(texts))
+
+    # 3. Stitch (text-space dedup) ───────────────────────────────────────────
+    frames_lines = [t.splitlines() for t in texts]
+    stitched = stitch_frames(frames_lines, fuzzy=0.85, strip_boilerplate=True)
+    transcript = stitched.text()
+    raw_path = out_dir / "transcript.raw.md"
+    raw_path.write_text(transcript, encoding="utf-8")
+    logger.info("Stitched transcript: %d lines", len(stitched.lines))
+
+    # 4. Optional LLM seam/indent cleanup ────────────────────────────────────
+    clean_path = None
+    if config.reconstruction.enabled and transcript.strip():
+        try:
+            cleaned = _cleanup_transcript(transcript, config)
+            clean_path = out_dir / "transcript.md"
+            clean_path.write_text(cleaned, encoding="utf-8")
+        except Exception as exc:
+            logger.error("LLM cleanup failed (%s); raw stitched transcript kept", exc)
+            clean_path = out_dir / "transcript.md"
+            clean_path.write_text(transcript, encoding="utf-8")
+    else:
+        clean_path = out_dir / "transcript.md"
+        clean_path.write_text(transcript, encoding="utf-8")
+
+    meta = {
+        "video": str(Path(video_path).resolve()),
+        "frames_selected": len(frames),
+        "frames_with_text": non_empty,
+        "ocr_model": ocr.model,
+        "llm_model": resolve_llm_model(config.reconstruction) if config.reconstruction.enabled else None,
+        "transcript_path": str(clean_path),
+        "raw_transcript_path": str(raw_path),
+        "elapsed_seconds": round(time.time() - t0, 1),
+    }
+    (out_dir / "transcribe_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return {"stage": "done", **meta}
