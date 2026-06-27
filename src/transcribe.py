@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from pathlib import Path
 
@@ -26,6 +27,27 @@ from .omlx_client import OMLXClient, normalize_omlx_base_url, resolve_llm_model,
 from .stitch import stitch_frames
 
 logger = logging.getLogger("screenlens.transcribe")
+
+# Cleanup is seam/indent repair ONLY — it must never drop content. An LLM
+# (especially a reasoning model) tends to "improve" by condensing, silently
+# dropping code blocks or lists. After each chunk we check what fraction of its
+# distinct non-blank input lines survived; below this we discard the LLM output
+# and keep the raw stitched chunk. The small slack tolerates legitimate edits
+# (stray header/footer removal, rejoining a line split across a frame seam).
+MIN_CHUNK_COVERAGE = 0.97
+
+
+def _chunk_coverage(src: str, repaired: str) -> float:
+    """Fraction of distinct non-blank input lines (whitespace-normalized) that
+    still appear in the repaired output. 1.0 means nothing was dropped."""
+    def norm_lines(t: str) -> set[str]:
+        return {re.sub(r"\s+", "", l) for l in t.splitlines() if l.strip()}
+
+    src_lines = norm_lines(src)
+    if not src_lines:
+        return 1.0
+    out_lines = norm_lines(repaired)
+    return sum(1 for l in src_lines if l in out_lines) / len(src_lines)
 
 
 CLEANUP_SYSTEM = (
@@ -61,7 +83,21 @@ def _llm_client(cfg) -> OMLXClient:
 def _cleanup_transcript(text: str, cfg) -> str:
     """LLM seam/indent cleanup, chunked by blank-line boundaries to fit context."""
     client = _llm_client(cfg)
-    budget_chars = int(cfg.reconstruction.model_context * 0.5) * 4  # ~half ctx, chars≈tokens*4
+    extra = (
+        {"chat_template_kwargs": {"enable_thinking": False}}
+        if cfg.reconstruction.disable_thinking
+        else None
+    )
+    # Cleanup is near-verbatim, so the repaired output is ~the same size as the
+    # input. The binding limit is therefore the OUTPUT cap (max_tokens), not just
+    # the context window: a chunk larger than max_tokens can emit guarantees
+    # mid-chunk truncation and silent content loss. Bound chunk input by BOTH the
+    # output cap and the context window (input+output+prompt must co-fit), with a
+    # safety margin. (chars ≈ tokens*4)
+    chars_per_token = 4
+    max_out_chars = cfg.reconstruction.max_tokens * chars_per_token
+    max_ctx_chars = int(cfg.reconstruction.model_context * 0.45) * chars_per_token
+    budget_chars = int(min(max_out_chars, max_ctx_chars) * 0.85)
     paras = text.split("\n\n")
     chunks, cur, cur_len = [], [], 0
     for p in paras:
@@ -79,8 +115,18 @@ def _cleanup_transcript(text: str, cfg) -> str:
             "Repair this stitched transcript segment. Output only the repaired text:\n\n" + ch,
             max_tokens=cfg.reconstruction.max_tokens,
             temperature=0.0,
-        )
-        out.append(repaired.strip())
+            extra=extra,
+        ).strip()
+        coverage = _chunk_coverage(ch, repaired)
+        if coverage < MIN_CHUNK_COVERAGE:
+            logger.warning(
+                "Cleanup chunk %d/%d dropped content (line coverage %.0f%% < %.0f%%); "
+                "keeping the raw stitched chunk to preserve fidelity.",
+                i + 1, len(chunks), coverage * 100, MIN_CHUNK_COVERAGE * 100,
+            )
+            out.append(ch.strip())
+        else:
+            out.append(repaired)
     return "\n\n".join(out).strip() + "\n"
 
 

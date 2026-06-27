@@ -63,6 +63,10 @@ class VerbatimOCR:
             "repetition_penalty": config.repetition_penalty,
             "no_repeat_ngram_size": config.no_repeat_ngram_size or None,
         }
+        if config.disable_thinking:
+            # Verbatim OCR needs no chain-of-thought. A reasoning model otherwise
+            # spends the whole token budget thinking and never emits the transcription.
+            self._extra["chat_template_kwargs"] = {"enable_thinking": False}
         self._probed = False
 
     # ── Capability checks ────────────────────────────────────────────────────
@@ -98,6 +102,7 @@ class VerbatimOCR:
                 images=[sample_image_path],
                 max_tokens=256,
                 temperature=0.0,
+                extra=self._extra,
             )
         except Exception as exc:
             raise RuntimeError(f"OCR probe call failed: {exc}") from exc

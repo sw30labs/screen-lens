@@ -25,16 +25,16 @@ video.mov
   → stitch.py         text-space dedup: fuzzy-canonicalize lines, difflib
                       matching-blocks find the scroll overlap, splice the new tail,
                       strip page headers/footers, majority-vote OCR flicker
-  → transcribe.py     optional text-LLM cleanup, STRICTLY seams + indentation
-  → data/<slug>/output/transcript.md
+  → transcribe.py     optional text-LLM cleanup (OFF by default, coverage-guarded)
+  → data/<slug>/output/transcript.md  (== transcript.raw.md unless --cleanup)
 ```
 
 Two models, separated by job:
 
 | Job | Model | Why |
 |-----|-------|-----|
-| **Read frames (OCR)** | a **vision** model — default `mlx-community/olmOCR-2-7B-1025-8bit` | purpose-built for dense document fidelity; never a text-only model again |
-| **Clean seams (LLM)** | a **text** model — `MiniMax-M2` is fine here | it never sees images; tidying stitched text is what it's good at |
+| **Read frames (OCR)** | a **vision** model — default `Qwen3.6-27B-bf16` | purpose-built for dense document fidelity; never a text-only model again |
+| **Clean seams (LLM)** | a **text** model — any capable model that fits the memory ceiling | it never sees images; tidying stitched text is what it's good at |
 
 The dedup that matters happens **in text space, after OCR** — proven robust to
 OCR flicker, dropped lines, and static-pause duplicate frames (see
@@ -103,3 +103,28 @@ and indentation — prompted never to re-invent content.
 > each served model vision / text-only / draft, and `transcribe` probes the model
 > with one real frame before processing — so a wrong choice fails instantly with
 > a clear message instead of producing empty output.
+
+## Update — reasoning-model hardening & cleanup made safe
+
+A later round of fixes after running on a reasoning OCR model (`Qwen3.6-27B`):
+
+- **Thinking is now disabled for OCR and cleanup.** A reasoning model used for
+  verbatim OCR emitted chain-of-thought ("The user wants me to transcribe…")
+  that consumed the entire `max_tokens` budget *before* reaching the answer — and
+  with the opening `<think>` in the chat-template prefix, there were no tags for
+  `strip_thinking` to catch. Both passes now send
+  `chat_template_kwargs={"enable_thinking": false}` (`OCRConfig.disable_thinking`
+  / `ReconstructionConfig.disable_thinking`, default true). `strip_thinking` also
+  handles dangling/unclosed `<think>`, and the client warns on
+  `finish_reason == "length"`.
+- **LLM cleanup is now OFF by default** (`--cleanup` to opt in). On verbatim
+  code/text the raw stitched OCR is already correct, and the LLM tends to drop
+  content while "repairing".
+- **Cleanup can no longer lose content.** Chunk input is bounded by the output
+  token cap (a bug previously fed ~55k-char chunks into an 8k-token output, so
+  each chunk truncated). And a per-chunk coverage guard (`MIN_CHUNK_COVERAGE =
+  0.97`) discards any LLM output that dropped lines, keeping the raw stitched
+  chunk — `transcript.md` is guaranteed ≥ the fidelity of `transcript.raw.md`.
+- **Model must fit the oMLX memory ceiling.** `MiniMax-M3-4bit` is ~236 GB and
+  won't load under a 71 GB ceiling; `Qwen3.6-27B-bf16` (~54 GB) is a safe text
+  cleanup model that also fits. Note oMLX serializes requests.

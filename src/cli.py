@@ -742,7 +742,7 @@ def transcribe(
     omlx_url: str = typer.Option(DEFAULT_OMLX_URL, help="oMLX API URL or dashboard URL"),
     omlx_api_key: Optional[str] = typer.Option(None, help="oMLX API key (default: MLX_API_KEY/OMLX_API_KEY)"),
     sample_fps: float = typer.Option(2.0, help="Frames/sec to sample before dedup"),
-    no_cleanup: bool = typer.Option(False, "--no-cleanup", help="Skip the LLM seam/indent cleanup pass"),
+    cleanup: bool = typer.Option(False, "--cleanup", help="Run the optional LLM seam/indent cleanup pass (default: off — the raw stitched transcript is already verbatim)"),
     deterministic: bool = typer.Option(False, "--deterministic", help="Also run Apple Vision backstop (best for code)"),
     config_file: Optional[str] = typer.Option(None, help="Path to config JSON file"),
 ):
@@ -771,7 +771,7 @@ def transcribe(
         config.ocr.api_key = omlx_api_key
         config.reconstruction.api_key = omlx_api_key
     config.frame_selection.sample_fps = sample_fps
-    config.reconstruction.enabled = not no_cleanup
+    config.reconstruction.enabled = cleanup
     config.ocr.deterministic_backstop = deterministic
 
     slug = _apply_video_slug(config, video)
@@ -782,7 +782,7 @@ def transcribe(
         f"Video: {video.name} ({video.stat().st_size / (1024**2):.0f} MB)\n"
         f"Output: {config.data_dir}/output/transcript.md\n"
         f"OCR (vision): {resolve_ocr_model(config.ocr)}\n"
-        f"Cleanup (text): {resolve_llm_model(config.reconstruction) if not no_cleanup else 'disabled'}\n"
+        f"Cleanup (text): {resolve_llm_model(config.reconstruction) if cleanup else 'disabled'}\n"
         f"Sample: {sample_fps} fps | Deterministic backstop: {deterministic}",
         title="Configuration",
     ))

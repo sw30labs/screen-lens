@@ -143,13 +143,36 @@ Scans all folders in `./data/`, classifies each recording (Python code, Markdown
 - **Reflection QA** — Up to 3 iterations of quality review before saving
 - **Output** — Reconstructed files saved to `./data/<video_name>/output/`
 
-### 6. Check Status
+### 6. Verbatim Transcription (reproduce the exact text/code shown)
+
+```bash
+# List served oMLX models, labeled vision / text-only / draft
+python -m src.cli models
+
+# Transcribe a recording character-for-character
+python -m src.cli transcribe input/policies.mov
+
+# Code recordings: add the Apple Vision deterministic cross-check
+python -m src.cli transcribe input/code.mov --deterministic   # requires: pip install ocrmac
+
+# Opt in to the LLM seam/indent cleanup pass (off by default)
+python -m src.cli transcribe input/doc.mov --cleanup
+```
+
+A separate pipeline from captioning. Instead of *describing* frames it **copies** them: it densely samples frames, OCRs each with a vision model (transcribe, never paraphrase), and stitches them in text space to undo scroll overlap. Designed for faithfully recovering source code, docs, and dense text from a scrolling screen recording.
+
+- **Two models, two jobs** — a **vision** model reads pixels (`OCR_MODEL`, default `Qwen3.6-27B-bf16`); a **text** model optionally tidies seams (`LLM_MODEL`). The OCR model is probed with one real frame before processing, so a text-only choice fails instantly instead of producing empty output.
+- **Thinking disabled for OCR** — a reasoning model would otherwise burn its whole token budget on chain-of-thought and never emit the transcription.
+- **Cleanup is off by default** — the raw stitched OCR is already verbatim. When enabled with `--cleanup`, a per-chunk coverage guard discards any LLM output that drops content and keeps the raw chunk, so `transcript.md` can never lose text vs. `transcript.raw.md`.
+- **Output** — `data/<slug>/output/transcript.md` (+ `transcript.raw.md`, `ocr/all_ocr.json`).
+
+### 7. Check Status
 
 ```bash
 python -m src.cli info
 ```
 
-### 7. Launch the Terminal GUI
+### 8. Launch the Terminal GUI
 
 ```bash
 python -m src.cli tui
@@ -204,6 +227,11 @@ src/
   vector_store.py    # ChromaDB storage + search
   pipeline.py        # LangGraph StateGraph orchestration (ingest/search/summarize)
   reconstruct.py     # LangGraph deep agents — artifact reconstruction with QA reflection
+  frame_select.py    # Scroll-safe frame selection for transcribe (dense sample + drop near-dupes)
+  ocr.py             # VerbatimOCR — vision OCR with capability guard, probe, anti-loop controls
+  stitch.py          # Text-space stitcher — undo scroll overlap, strip headers/footers
+  transcribe.py      # Verbatim transcription orchestrator + optional coverage-guarded cleanup
+  omlx_client.py     # oMLX OpenAI-compatible client (shared by all pipelines)
   cli.py             # Typer CLI interface
   tui.py             # Optional Textual/Rich terminal GUI
 data/

@@ -158,6 +158,99 @@ def test_transcribe_end_to_end_with_mock_ocr(tmp_path, monkeypatch):
     assert len(out) <= len(doc) + 3
 
 
+# ── Thinking leak regression ─────────────────────────────────────────────────
+#
+# A reasoning OCR model (e.g. Qwen3.x) emitted chain-of-thought instead of the
+# transcription and exhausted max_tokens before closing </think>, so the whole
+# response was untagged/truncated reasoning that leaked into transcript.md.
+
+def test_strip_thinking_handles_truncated_open_tag():
+    from src.omlx_client import strip_thinking
+    # complete block
+    assert strip_thinking("<think>reasoning</think>\n\nANSWER") == "ANSWER"
+    # dangling close (opening tag was a prompt prefix) — keep the answer
+    assert strip_thinking("reasoning</think>\n\nANSWER") == "ANSWER"
+    # dangling open, generation truncated mid-thought — no answer survives
+    assert strip_thinking("prefix<think>truncated reasoning forever") == "prefix"
+    # clean text untouched
+    assert strip_thinking("just an answer") == "just an answer"
+
+
+def test_ocr_disables_thinking_in_request_payload(monkeypatch, tmp_path):
+    """OCR must send chat_template_kwargs.enable_thinking=false so a reasoning
+    model produces the transcription instead of burning the budget on CoT."""
+    import json
+    from PIL import Image
+    import src.omlx_client as omlx_client
+
+    img_path = tmp_path / "frame.png"
+    Image.new("RGB", (4, 4), color="white").save(img_path)
+
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self):
+            return json.dumps({"choices": [{"message": {"content": "hello"}}]}).encode()
+
+    def fake_urlopen(req, timeout):
+        captured["payload"] = json.loads(req.data.decode("utf-8"))
+        return FakeResponse()
+
+    monkeypatch.setattr(omlx_client.request, "urlopen", fake_urlopen)
+
+    ocr = VerbatimOCR(OCRConfig(model="Qwen3-VL-test", disable_thinking=True))
+    assert ocr.ocr_frame(str(img_path)) == "hello"
+    assert captured["payload"]["chat_template_kwargs"] == {"enable_thinking": False}
+
+    # When disabled, the knob must NOT be sent.
+    captured.clear()
+    ocr2 = VerbatimOCR(OCRConfig(model="Qwen3-VL-test", disable_thinking=False))
+    ocr2.ocr_frame(str(img_path))
+    assert "chat_template_kwargs" not in captured["payload"]
+
+
+# ── Cleanup never drops content (coverage guard) ─────────────────────────────
+#
+# An LLM (esp. a reasoning model) silently condenses — dropping code blocks /
+# lists despite "never remove content". The guard falls back to the raw stitched
+# chunk whenever the repaired output dropped too many input lines.
+
+def test_chunk_coverage_metric():
+    from src.transcribe import _chunk_coverage
+    src = "line one\n    line two\nline three"
+    assert _chunk_coverage(src, "line one\nline two\n  line three") == 1.0  # reindent ok
+    assert round(_chunk_coverage(src, "line one\nline three"), 2) == 0.67   # dropped a line
+    assert _chunk_coverage(src, "") == 0.0
+
+
+def test_cleanup_falls_back_to_raw_when_llm_drops_content(monkeypatch):
+    import src.omlx_client as omlx_client
+    import src.transcribe as T
+    from src.config import ScreenLensConfig
+
+    raw = "\n\n".join(f"keep_line_{i} = {i}" for i in range(20))
+
+    class FakeResponse:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self):
+            # The "LLM" returns only the first line — a gross content drop.
+            import json
+            return json.dumps(
+                {"choices": [{"message": {"content": "keep_line_0 = 0"}}]}
+            ).encode()
+
+    monkeypatch.setattr(omlx_client.request, "urlopen", lambda req, timeout: FakeResponse())
+
+    cfg = ScreenLensConfig()
+    out = T._cleanup_transcript(raw, cfg)
+    # All original lines survive because the guard discarded the lossy LLM output.
+    for i in range(20):
+        assert f"keep_line_{i} = {i}" in out
+
+
 # ── Scroll-safe frame selection on a REAL recording ──────────────────────────
 
 REAL_VIDEO = Path(__file__).resolve().parents[1] / "input" / "policies.mov"

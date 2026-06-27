@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import re
 from pathlib import Path
@@ -17,6 +18,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
 
 from .config import CaptioningConfig
+
+logger = logging.getLogger("screenlens.omlx")
 
 
 DEFAULT_OMLX_BASE_URL = "http://127.0.0.1:8000/v1"
@@ -234,10 +237,20 @@ def validate_omlx_vision_model(model_id: str) -> None:
 
 
 def strip_thinking(text: str) -> str:
-    """Remove Qwen/DeepSeek-style thinking blocks from final user-visible text."""
+    """Remove Qwen/DeepSeek-style thinking blocks from final user-visible text.
+
+    Handles three shapes:
+      * complete ``<think>…</think>`` blocks,
+      * a dangling ``</think>`` (opening tag was a prompt prefix) — keep what
+        follows,
+      * a dangling ``<think>`` with no close — generation was truncated mid-
+        reasoning, so everything after it is thinking with no answer; drop it.
+    """
     cleaned = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
     if "</think>" in cleaned:
         cleaned = cleaned.split("</think>", 1)[1]
+    elif "<think>" in cleaned:
+        cleaned = cleaned.split("<think>", 1)[0]
     return cleaned.strip()
 
 
@@ -394,6 +407,13 @@ class OMLXClient:
             raise RuntimeError(f"oMLX response contained no choices: {response}")
 
         first = choices[0]
+        if isinstance(first, dict) and first.get("finish_reason") == "length":
+            logger.warning(
+                "oMLX truncated the response at max_tokens=%s (finish_reason=length). "
+                "For a reasoning model this usually means it ran out of budget mid-"
+                "thought and never reached the answer — disable thinking or raise "
+                "max_tokens.", payload.get("max_tokens"),
+            )
         if isinstance(first, dict):
             if "message" in first and isinstance(first["message"], dict):
                 return _message_text(first["message"].get("content"))

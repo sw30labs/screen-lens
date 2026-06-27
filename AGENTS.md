@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-ScreenLens is a Python 3.11+ package for local video scene intelligence. Core code lives in `src/`: `cli.py` exposes the Typer CLI, `pipeline.py` wires LangGraph flows, and modules such as `frame_extractor.py`, `captioner.py`, `embedder.py`, `vector_store.py`, `reconstruct.py`, and `config.py` own individual pipeline stages. Tests live in `tests/`, with YAML scenarios in `tests/test_cases.yaml`. Utility and benchmarking scripts live in `scripts/`. Static README assets live in `assets/`. Generated outputs, model artifacts, videos, and local databases belong in ignored paths such as `data/`, `OUTPUT/`, `ratita/`, and `input-videos/`.
+ScreenLens is a Python 3.11+ package for local video scene intelligence. Core code lives in `src/`: `cli.py` exposes the Typer CLI, `pipeline.py` wires LangGraph flows, and modules such as `frame_extractor.py`, `captioner.py`, `embedder.py`, `vector_store.py`, `reconstruct.py`, and `config.py` own individual pipeline stages. The verbatim transcription path adds `frame_select.py`, `ocr.py`, `stitch.py`, and `transcribe.py`, all going through the shared `omlx_client.py` adapter. Tests live in `tests/` (`test_pipeline.py`, `test_transcribe.py`), with YAML scenarios in `tests/test_cases.yaml`. Utility and benchmarking scripts live in `scripts/`. Static README assets live in `assets/`. Generated outputs, model artifacts, videos, and local databases belong in ignored paths such as `data/`, `OUTPUT/`, `ratita/`, and `input-videos/`.
 
 ## Build, Test, and Development Commands
 
@@ -30,6 +30,13 @@ Run the CLI directly during development:
 python -m src.cli info
 python -m src.cli ingest "video.mov"
 python -m src.cli search "What application is shown?"
+python -m src.cli transcribe "video.mov"   # verbatim OCR path; cleanup off by default (--cleanup to enable)
+```
+
+Run the transcribe tests:
+
+```bash
+pytest tests/test_transcribe.py -v
 ```
 
 ## Coding Style & Naming Conventions

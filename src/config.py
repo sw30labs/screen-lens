@@ -187,6 +187,16 @@ class OCRConfig(BaseModel):
         default=True,
         description="Abort if the served model is not vision-capable (prevents the blind-model bug)",
     )
+    disable_thinking: bool = Field(
+        default=True,
+        description=(
+            "Disable model 'thinking'/reasoning for OCR. Verbatim copy needs no "
+            "chain-of-thought; a reasoning model (e.g. Qwen3.x) otherwise burns the "
+            "whole token budget on reasoning and never emits the transcription. "
+            "Sends chat_template_kwargs.enable_thinking=false (honored by Qwen3 / "
+            "vLLM / SGLang / MLX-LM servers)."
+        ),
+    )
 
 
 # ── Frame selection for transcription (NEW) ──────────────────────────────────
@@ -219,7 +229,16 @@ class FrameSelectionConfig(BaseModel):
 
 class ReconstructionConfig(BaseModel):
     """Settings for the optional LLM cleanup/reconstruction pass."""
-    enabled: bool = Field(default=True, description="Run an LLM cleanup pass over the stitched transcript")
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Run an LLM cleanup pass over the stitched transcript. Off by default: "
+            "the raw stitched OCR is already verbatim, and an LLM tends to drop "
+            "content while 'repairing' (the per-chunk coverage guard then discards "
+            "most of its output anyway). Enable for prose where seam/indent tidying "
+            "is worth the cost."
+        ),
+    )
     base_url: str = Field(default="http://127.0.0.1:8000/v1")
     model: Optional[str] = Field(
         default=None,
@@ -230,6 +249,15 @@ class ReconstructionConfig(BaseModel):
     temperature: float = Field(default=0.0)
     max_tokens: int = Field(default=8192)
     model_context: int = Field(default=32768, description="Assumed context window for chunk planning")
+    disable_thinking: bool = Field(
+        default=True,
+        description=(
+            "Disable model 'thinking'/reasoning for the seam/indent cleanup pass. "
+            "The repair is near-verbatim; a reasoning text model (e.g. MiniMax-M2) "
+            "otherwise wastes the token budget reasoning before emitting the "
+            "repaired transcript."
+        ),
+    )
 
 
 # ── Embedding ───────────────────────────────────────────────────────────────
