@@ -28,6 +28,7 @@ ratita/
 
 # Input videos folder
 input-videos/
+input/
 
 # Video files
 *.mov
