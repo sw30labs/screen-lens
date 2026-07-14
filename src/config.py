@@ -201,11 +201,20 @@ class CaptioningConfig(BaseModel):
     # Shared generation settings
     temperature: float = Field(default=0.1, description="LLM temperature for captions")
     max_tokens: int = Field(
-        default=4096,
+        default=32768,
         description=(
-            "Max output tokens per caption. Kept below the 32K DGX context so image "
-            "and prompt tokens still fit."
+            "Requested output-token ceiling per caption. When this reaches the "
+            "served vLLM context size, ScreenLens lets vLLM use all context "
+            "remaining after the prompt and image."
         ),
+    )
+    repetition_penalty: float = Field(
+        default=1.05,
+        description="Lightly discourage degenerate long-form caption repetition",
+    )
+    no_repeat_ngram_size: int = Field(
+        default=12,
+        description="Block long repeated caption loops (0 disables)",
     )
     batch_size: int = Field(
         default_factory=default_inference_concurrency,

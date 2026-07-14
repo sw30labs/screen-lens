@@ -22,6 +22,16 @@ and targets 20% GPU memory so image inference, OpenCLIP, the operating system,
 and other local workloads share the DGX Spark's 128 GB unified-memory pool
 safely.
 
+ScreenLens requests captions with a 32K output ceiling. Prompt, chat-template,
+image, and completion tokens share the server's 32K context, so a literal
+`max_tokens=32768` would reserve zero input space and fail. At that ceiling the
+client omits `max_tokens`; vLLM then assigns the exact context remaining after
+the input instead of truncating every caption at the former 4K client cap.
+Direct captions also use light repetition controls so a malformed generation
+cannot consume that entire ceiling by looping. Later reconstruction stages
+greedily pack captions by serialized size and split an individually oversized
+caption; they do not assume every frame caption is near the global average.
+
 ## Sharing vLLM with DigitalTwin
 
 DigitalTwin uses the same model and loopback port. Only one Compose project can

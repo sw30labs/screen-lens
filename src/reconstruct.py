@@ -31,7 +31,7 @@ from .omlx_client import InferenceClient
 # Reuse the chunk-strategy math from the summarization pipeline. It's the same
 # token-budget problem (fit a long caption stream into a fixed model context),
 # so we deliberately share the helper rather than duplicate the constants.
-from .pipeline import _compute_chunk_strategy
+from .pipeline import _chunk_captions_by_budget, _compute_chunk_strategy
 
 logger = logging.getLogger("screenlens.reconstruct")
 
@@ -47,13 +47,10 @@ CONTENT_TYPES = {
 
 MAX_QA_ITERATIONS = 3
 
-# Cap on captions per Pass-1 extraction chunk. ``_compute_chunk_strategy``
-# maximizes chunk size to minimize chunk count, which on a model with a
-# very large context window (e.g. Qwen3.5-122B at ~256k tokens) yields
-# chunks of 200+ captions. Each chunk only gets ~2k output tokens of
-# extraction notes, so oversized chunks force the client into aggressive
-# compression and lose specifics. This cap keeps extraction fidelity
-# bounded regardless of model context size.
+# Fidelity cap in addition to the serialized-size budget. On a model with a
+# very large context window, hundreds of short captions may technically fit,
+# but each extraction call still gets only ~2K output tokens and would be
+# forced to compress away details.
 MAX_CAPTIONS_PER_CHUNK = 50
 
 
@@ -361,9 +358,35 @@ def _stratified_sample(items: list, n: int) -> list:
     return [items[int(round(i * step))] for i in range(n)]
 
 
-def _chunk_list(items: list, chunk_size: int) -> list[list]:
-    """Split items into contiguous chunks of at most ``chunk_size``."""
-    return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
+def _estimated_text_tokens(text: str) -> int:
+    """Estimate serialized note cost, including a separator allowance."""
+    return max(1, (len(text) + 1) // 2) + 50
+
+
+def _chunk_texts_by_budget(items: list[str], token_budget: int) -> list[list[str]]:
+    """Greedily group notes by size and split an individually oversized note."""
+    if token_budget <= 50:
+        raise ValueError(f"Text token budget is too small: {token_budget}")
+    max_text_chars = max(1, (token_budget - 50) * 2)
+    units = [
+        text[start : start + max_text_chars]
+        for text in items
+        for start in range(0, max(len(text), 1), max_text_chars)
+    ]
+    groups: list[list[str]] = []
+    current: list[str] = []
+    current_tokens = 0
+    for text in units:
+        text_tokens = _estimated_text_tokens(text)
+        if current and current_tokens + text_tokens > token_budget:
+            groups.append(current)
+            current = []
+            current_tokens = 0
+        current.append(text)
+        current_tokens += text_tokens
+    if current:
+        groups.append(current)
+    return groups
 
 
 def _get_model_context_size(client) -> int:
@@ -378,10 +401,11 @@ def _extract_segment_notes(
 ) -> list[str]:
     """Pass 1 of hierarchical reconstruction: extract content notes per chunk.
 
-    Uses ``_compute_chunk_strategy`` to size chunks against the model's
-    context window. Each chunk gets a single inference call producing structured
-    extraction notes (raw content, no synthesis). The result is a list of
-    notes — one per chunk — that downstream synthesis passes consume.
+    Uses ``_compute_chunk_strategy`` for the safe input budget, then greedily
+    packs each serialized caption by size. Each chunk gets a single inference
+    call producing structured extraction notes (raw content, no synthesis).
+    The result is a list of notes — one per chunk — that downstream synthesis
+    passes consume.
 
     Task-agnostic by design: the same extraction is reused across all tasks
     in a single iteration AND across QA retries (cached in state). This
@@ -390,17 +414,19 @@ def _extract_segment_notes(
     """
     strategy = _compute_chunk_strategy(captions, model_context)
 
-    # Cap chunk_size for fidelity (see MAX_CAPTIONS_PER_CHUNK comment).
-    if (strategy["strategy"] == "hierarchical"
-            and strategy["chunk_size"] > MAX_CAPTIONS_PER_CHUNK):
-        strategy["chunk_size"] = MAX_CAPTIONS_PER_CHUNK
-        strategy["num_chunks"] = -(-len(captions) // MAX_CAPTIONS_PER_CHUNK)
+    chunks = _chunk_captions_by_budget(
+        captions,
+        strategy["safe_context_tokens"],
+        max_captions=MAX_CAPTIONS_PER_CHUNK,
+    )
+    extraction_strategy = "single_pass" if len(chunks) <= 1 else "hierarchical"
+    max_chunk_size = max((len(chunk) for chunk in chunks), default=0)
 
-    print(f"    [Pass 1] strategy={strategy['strategy']} "
-          f"chunk_size={strategy['chunk_size']} "
-          f"chunks={strategy['num_chunks']}")
+    print(f"    [Pass 1] strategy={extraction_strategy} "
+          f"max_chunk_size={max_chunk_size} "
+          f"chunks={len(chunks)}")
 
-    if strategy["strategy"] == "single_pass":
+    if extraction_strategy == "single_pass":
         # Whole recording fits in one call. Still use the extraction prompt so
         # the downstream synthesis pipeline sees a uniform input format.
         all_block = "\n\n---\n\n".join(
@@ -417,7 +443,6 @@ def _extract_segment_notes(
         )
         return [f"[Full recording]\n{notes}"]
 
-    chunks = _chunk_list(captions, strategy["chunk_size"])
     segment_notes: list[str] = []
 
     for i, chunk in enumerate(chunks, 1):
@@ -483,10 +508,9 @@ def _hierarchical_synthesize(
         int((model_context - OVERHEAD_TOKENS - max_output_tokens) * 0.85),
     )
 
-    total_chars = sum(len(n) + 50 for n in notes)  # +50 per separator
-    estimated_tokens = total_chars // 4
+    estimated_tokens = sum(_estimated_text_tokens(note) for note in notes)
 
-    if estimated_tokens <= safe_input_tokens or len(notes) <= 1:
+    if estimated_tokens <= safe_input_tokens:
         # Single synthesis pass — all notes fit
         notes_block = "\n\n---\n\n".join(notes)
         user = (
@@ -502,18 +526,15 @@ def _hierarchical_synthesize(
             max_tokens=max_output_tokens, temperature=0.1,
         )
 
-    # Recursive group-and-condense. Choose a group size that leaves headroom
-    # for the intermediate synthesis output, then recurse on the result.
-    avg_chars_per_note = total_chars / len(notes)
-    notes_per_group = max(
-        2,
-        int((safe_input_tokens * 4) / avg_chars_per_note * 0.7),
-    )
+    # Recursive group-and-condense. Budget each serialized note independently;
+    # a fixed count derived from the average fails when one note is an outlier.
+    groups = _chunk_texts_by_budget(notes, safe_input_tokens)
+    max_group_size = max((len(group) for group in groups), default=0)
 
     print(f"    [Pass 2] {len(notes)} notes (~{estimated_tokens:,} tok) "
-          f"exceed budget — recursing in groups of {notes_per_group}")
+          f"exceed budget — recursing in {len(groups)} size-budgeted groups "
+          f"(max {max_group_size} notes)")
 
-    groups = _chunk_list(notes, notes_per_group)
     intermediate_notes: list[str] = []
 
     for i, group in enumerate(groups, 1):

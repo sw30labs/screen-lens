@@ -212,7 +212,9 @@ All settings live in `src/config.py` as Pydantic models. Key parameters:
 | `captioning.omlx_base_url` | http://127.0.0.1:8000/v1 | Apple oMLX URL; root/dashboard URLs are normalized |
 | `captioning.omlx_model` | null | Falls back to `MLX_MODEL`/`OMLX_MODEL`/`LLM_MODEL`, then `default` |
 | `captioning.batch_size` | 2 DGX / 4 Apple | Concurrent direct-server caption requests |
-| `captioning.max_tokens` | 4096 | Maximum output tokens per caption |
+| `captioning.max_tokens` | 32768 | Requested caption ceiling; vLLM uses the context remaining after image/prompt tokens |
+| `captioning.repetition_penalty` | 1.05 | Discourage pathological long caption loops |
+| `captioning.no_repeat_ngram_size` | 12 | Block repeated long caption sequences; `0` disables |
 | `captioning.disable_thinking` | true | Spend the output budget on the visible answer |
 | `embedding.model_name` | ViT-B-32 | OpenCLIP architecture |
 | `embedding.device` | CUDA DGX / MPS Apple | Accelerator for OpenCLIP; CPU elsewhere |
@@ -224,7 +226,7 @@ All settings live in `src/config.py` as Pydantic models. Key parameters:
 
 Direct backends receive one OpenAI-compatible image request per frame. Image encoding and prompt prefill usually dominate short captions, so the main levers are frame dimensions, model size, and request concurrency. The bundled Spark service admits two sequences and ScreenLens therefore defaults to two requests there. Apple defaults to four, but large oMLX models may benefit from a lower value.
 
-DGX Spark has one 128 GB unified-memory pool rather than separate system RAM and VRAM. Keep the checked vLLM allocator target at `0.2`, the 32K context, and concurrency two until the complete workload has been measured. See [the Spark memory notes](docs/DGX_SPARK.md#memory-and-performance-notes).
+DGX Spark has one 128 GB unified-memory pool rather than separate system RAM and VRAM. Keep the checked vLLM allocator target at `0.2`, the 32K context, and concurrency two until the complete workload has been measured. Caption requests use a 32K output ceiling; because input and output share that window, ScreenLens omits the literal limit and lets vLLM allocate all tokens remaining after the prompt and image. Reconstruction groups captions by serialized size rather than frame count, so an unusually long caption cannot overfill a later prompt. See [the Spark memory notes](docs/DGX_SPARK.md#memory-and-performance-notes).
 
 ## Project Structure
 

@@ -124,7 +124,7 @@ Key mechanics worth knowing before editing:
 
 A single `ScreenLensConfig` Pydantic model composed of `FrameExtractionConfig`, `CaptioningConfig`, `EmbeddingConfig`, `VectorDBConfig`, `SearchConfig`, plus `OCRConfig`, `FrameSelectionConfig`, and `ReconstructionConfig`. `CaptionBackend` is `vllm | omlx | ollama`; direct OCR/reconstruction uses `InferenceBackend` (`vllm | omlx`). The CLI mutates the config from flags before passing `config.model_dump()` into graph state.
 
-Use `--inference-url`, `--inference-model`, and `--inference-api-key` for direct endpoints. `--vllm-*` and `--omlx-*` are aliases. Environment resolution is provider-specific (`VLLM_*` versus `MLX_*`/`OMLX_*`), and `SCREENLENS_BACKEND`, `SCREENLENS_DEVICE`, and `SCREENLENS_BATCH_SIZE` override platform defaults. Caption `max_tokens` is 4096 so image + prompt + output fit the bundled 32K Spark context.
+Use `--inference-url`, `--inference-model`, and `--inference-api-key` for direct endpoints. `--vllm-*` and `--omlx-*` are aliases. Environment resolution is provider-specific (`VLLM_*` versus `MLX_*`/`OMLX_*`), and `SCREENLENS_BACKEND`, `SCREENLENS_DEVICE`, and `SCREENLENS_BATCH_SIZE` override platform defaults. Caption `max_tokens` defaults to a 32K requested ceiling. When that equals the vLLM context, the client omits the literal field so vLLM uses the exact context remaining after image and prompt tokens. Reconstruction chunks by serialized caption size, not a global average or fixed frame count; keep the outlier-caption tests when changing token planning.
 
 ### Data Layout
 

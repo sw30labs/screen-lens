@@ -34,11 +34,12 @@ class OpenAICompatibleCaptioner:
 
     def caption(self, image_path: str) -> str:
         """Generate a caption for a single frame."""
-        extra = (
-            {"chat_template_kwargs": {"enable_thinking": False}}
-            if self.config.disable_thinking
-            else None
-        )
+        extra = {
+            "repetition_penalty": self.config.repetition_penalty,
+            "no_repeat_ngram_size": self.config.no_repeat_ngram_size or None,
+        }
+        if self.config.disable_thinking:
+            extra["chat_template_kwargs"] = {"enable_thinking": False}
         return self._client.chat(
             self.config.system_prompt,
             self.config.user_prompt,

@@ -31,6 +31,18 @@ DEFAULT_OMLX_BASE_URL = "http://127.0.0.1:8000/v1"
 DEFAULT_VLLM_BASE_URL = "http://127.0.0.1:8000/v1"
 DEFAULT_VLLM_MODEL = "nvidia/Qwen3.6-35B-A3B-NVFP4"
 DEFAULT_VLLM_CONTEXT = 32768
+_VLLM_CONTEXT_ERROR_PARAMS = {"input_tokens", "input_text"}
+_TOKENIZE_CHAT_FIELDS = {
+    "model",
+    "messages",
+    "add_generation_prompt",
+    "continue_final_message",
+    "chat_template",
+    "chat_template_kwargs",
+    "media_io_kwargs",
+    "mm_processor_kwargs",
+    "tools",
+}
 _API_KEY_PLACEHOLDERS = {
     "your-api-key",
     "your-api-key-here",
@@ -438,7 +450,7 @@ class OpenAICompatibleClient:
         backend: str | InferenceBackend = InferenceBackend.omlx,
         timeout: float = 600.0,
         context_size: int = 32768,
-        default_max_tokens: int = 4096,
+        default_max_tokens: int = 32768,
         default_temperature: float = 0.0,
     ) -> "OpenAICompatibleClient":
         """Build a client directly from endpoint params (no CaptioningConfig).
@@ -493,23 +505,139 @@ class OpenAICompatibleClient:
         else:
             user_content = user_prompt
 
+        requested_max_tokens = (
+            max_tokens if max_tokens is not None else self._default_max_tokens
+        )
         payload = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
             ],
-            "max_tokens": max_tokens if max_tokens is not None else self._default_max_tokens,
             "temperature": temperature if temperature is not None else self._default_temperature,
             "stream": False,
         }
+        # vLLM's context limit includes the chat template, prompt, image tokens,
+        # and completion. Reserving the entire 32K window as max_tokens leaves
+        # zero room for input and is rejected. Omitting the field at that ceiling
+        # makes vLLM compute max_model_len - actual_input_length, which is the
+        # largest valid completion budget for each image. Explicit smaller caps
+        # remain exact, and oMLX retains its existing explicit-field behavior.
+        if not (
+            self.backend == InferenceBackend.vllm
+            and requested_max_tokens >= self.context_size
+        ):
+            payload["max_tokens"] = requested_max_tokens
         # Pass-through sampler controls (repetition_penalty, no_repeat_ngram_size,
         # etc.). Both the bundled vLLM recipe and current oMLX accept these.
         if extra:
             payload.update({k: v for k, v in extra.items() if v is not None})
         return strip_thinking(self._post_chat(payload))
 
-    def _post_chat(self, payload: dict[str, Any]) -> str:
+    def _tokenize_url(self) -> str:
+        """Return vLLM's root-level tokenization endpoint URL."""
+        parsed = urlsplit(self.base_url)
+        path = parsed.path.rstrip("/")
+        if path.endswith("/v1"):
+            path = path[:-3]
+        return urlunsplit((parsed.scheme, parsed.netloc, f"{path}/tokenize", "", ""))
+
+    def _tokenize_chat(self, payload: dict[str, Any]) -> tuple[int, int] | None:
+        """Ask vLLM for the exact rendered chat token count, if supported."""
+        tokenize_payload = {
+            key: value
+            for key, value in payload.items()
+            if key in _TOKENIZE_CHAT_FIELDS
+        }
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        req = request.Request(
+            self._tokenize_url(),
+            data=json.dumps(tokenize_payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with _urlopen(req, timeout=self.timeout) as resp:
+                response = json.load(resp)
+            return int(response["count"]), int(response["max_model_len"])
+        except (HTTPError, URLError, TimeoutError, KeyError, TypeError, ValueError):
+            return None
+
+    def _context_retry_payload(
+        self,
+        payload: dict[str, Any],
+        status_code: int,
+        detail: str,
+    ) -> dict[str, Any] | None:
+        """Build one exact-budget retry for a structured vLLM context error."""
+        if self.backend != InferenceBackend.vllm or status_code != 400:
+            return None
+        try:
+            decoded = json.loads(detail)
+        except json.JSONDecodeError:
+            return None
+        error = decoded.get("error", decoded) if isinstance(decoded, dict) else {}
+        if not isinstance(error, dict):
+            return None
+        message = str(error.get("message", ""))
+        if (
+            error.get("param") not in _VLLM_CONTEXT_ERROR_PARAMS
+            or "maximum context length" not in message.lower()
+        ):
+            return None
+
+        requested = payload.get("max_completion_tokens", payload.get("max_tokens"))
+        if requested is None:
+            return None
+
+        tokenized = self._tokenize_chat(payload)
+        retry = dict(payload)
+        if tokenized is None:
+            # Older vLLM builds may not expose /tokenize. Omitting both output
+            # fields lets vLLM allocate the exact remaining context itself.
+            retry.pop("max_tokens", None)
+            retry.pop("max_completion_tokens", None)
+            logger.warning(
+                "vLLM rejected the explicit completion reservation; /tokenize "
+                "is unavailable, retrying once with the remaining context."
+            )
+            return retry
+
+        prompt_tokens, max_model_len = tokenized
+        available = max_model_len - prompt_tokens
+        if available <= 0:
+            raise RuntimeError(
+                f"vllm prompt uses {prompt_tokens:,} tokens, exceeding the "
+                f"server's {max_model_len:,}-token context before any response "
+                "can be generated. Reduce or split the prompt."
+            )
+
+        retry_tokens = min(int(requested), available)
+        if retry_tokens >= int(requested):
+            return None
+        if "max_completion_tokens" in retry:
+            retry["max_completion_tokens"] = retry_tokens
+            retry.pop("max_tokens", None)
+        else:
+            retry["max_tokens"] = retry_tokens
+        logger.warning(
+            "vLLM prompt uses %s of %s context tokens; retrying once with "
+            "max_tokens=%s instead of %s.",
+            prompt_tokens,
+            max_model_len,
+            retry_tokens,
+            requested,
+        )
+        return retry
+
+    def _post_chat(
+        self,
+        payload: dict[str, Any],
+        *,
+        allow_context_retry: bool = True,
+    ) -> str:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -526,6 +654,13 @@ class OpenAICompatibleClient:
                 response = json.load(resp)
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace").strip()
+            if allow_context_retry:
+                retry_payload = self._context_retry_payload(payload, exc.code, detail)
+                if retry_payload is not None:
+                    return self._post_chat(
+                        retry_payload,
+                        allow_context_retry=False,
+                    )
             hint = ""
             if exc.code == 401:
                 hint = (
@@ -549,11 +684,25 @@ class OpenAICompatibleClient:
 
         first = choices[0]
         if isinstance(first, dict) and first.get("finish_reason") == "length":
+            completion_limit = payload.get(
+                "max_completion_tokens",
+                payload.get("max_tokens"),
+            )
+            if completion_limit is None:
+                completion_limit = (
+                    f"remaining space in the {self.context_size}-token context"
+                )
+                remedy = "the model context limit"
+            else:
+                remedy = "max_tokens without exceeding the model context"
             logger.warning(
-                "%s truncated the response at max_tokens=%s (finish_reason=length). "
+                "%s truncated the response at %s (finish_reason=length). "
                 "For a reasoning model this usually means it ran out of budget mid-"
                 "thought and never reached the answer — disable thinking or raise "
-                "max_tokens.", self.backend.value, payload.get("max_tokens"),
+                "%s.",
+                self.backend.value,
+                completion_limit,
+                remedy,
             )
         if isinstance(first, dict):
             if "message" in first and isinstance(first["message"], dict):

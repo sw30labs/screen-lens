@@ -7,8 +7,10 @@ import json
 import os
 import shutil
 import tempfile
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+from urllib.error import HTTPError
 
 import pytest
 import yaml
@@ -43,7 +45,7 @@ class TestConfig:
         assert config.captioning.backend == CaptionBackend.vllm
         assert config.captioning.vllm_base_url == "http://127.0.0.1:8000/v1"
         assert config.captioning.disable_thinking is True
-        assert config.captioning.max_tokens == 4096
+        assert config.captioning.max_tokens == 32768
         assert config.captioning.batch_size == 2
         assert config.ocr.backend == InferenceBackend.vllm
         assert config.frame_extraction.fps == 1.0
@@ -63,6 +65,7 @@ class TestConfig:
 
         config = ScreenLensConfig()
         assert config.captioning.backend == CaptionBackend.omlx
+        assert config.captioning.max_tokens == 32768
         assert config.captioning.batch_size == 4
         assert config.embedding.device == "mps"
 
@@ -344,6 +347,160 @@ class TestOMLXClient:
         assert user_content[0] == {"type": "text", "text": "describe"}
         assert user_content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
 
+    @pytest.mark.parametrize(
+        ("backend", "context_size", "default_max_tokens", "expected_max_tokens"),
+        [
+            ("vllm", 32768, 32768, None),
+            ("vllm", 65536, 32768, 32768),
+            ("vllm", 32768, 4096, 4096),
+            ("omlx", 32768, 32768, 32768),
+        ],
+    )
+    def test_chat_uses_remaining_vllm_context_at_full_ceiling(
+        self,
+        backend,
+        context_size,
+        default_max_tokens,
+        expected_max_tokens,
+        monkeypatch,
+    ):
+        from src.omlx_client import InferenceClient
+        import src.omlx_client as inference_client
+
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "choices": [{
+                        "message": {"content": "complete"},
+                        "finish_reason": "stop",
+                    }],
+                }).encode("utf-8")
+
+        def fake_urlopen(req, timeout):
+            captured.update(json.loads(req.data.decode("utf-8")))
+            return FakeResponse()
+
+        monkeypatch.setattr(inference_client, "_urlopen", fake_urlopen)
+        client = InferenceClient.from_endpoint(
+            base_url="http://127.0.0.1:8000/v1",
+            model="vision-model",
+            api_key="local",
+            backend=backend,
+            context_size=context_size,
+            default_max_tokens=default_max_tokens,
+        )
+
+        assert client.chat("system", "user") == "complete"
+        if expected_max_tokens is None:
+            assert "max_tokens" not in captured
+        else:
+            assert captured["max_tokens"] == expected_max_tokens
+
+    def test_vllm_context_overflow_retries_with_exact_remaining_tokens(
+        self,
+        monkeypatch,
+    ):
+        from src.omlx_client import InferenceClient
+        import src.omlx_client as inference_client
+
+        chat_payloads = []
+        tokenize_payloads = []
+
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        def fake_urlopen(req, timeout):
+            payload = json.loads(req.data.decode("utf-8"))
+            if req.full_url.endswith("/tokenize"):
+                tokenize_payloads.append(payload)
+                return FakeResponse({"count": 30721, "max_model_len": 32768, "tokens": []})
+
+            chat_payloads.append(payload)
+            if len(chat_payloads) == 1:
+                detail = json.dumps({
+                    "error": {
+                        "message": (
+                            "This model's maximum context length is 32768 tokens. "
+                            "However, you requested 2048 output tokens and your prompt "
+                            "contains at least 30721 input tokens."
+                        ),
+                        "type": "BadRequestError",
+                        "param": "input_tokens",
+                        "code": 400,
+                    },
+                }).encode("utf-8")
+                raise HTTPError(req.full_url, 400, "Bad Request", {}, BytesIO(detail))
+            return FakeResponse({
+                "choices": [{
+                    "message": {"content": "recovered"},
+                    "finish_reason": "stop",
+                }],
+            })
+
+        monkeypatch.setattr(inference_client, "_urlopen", fake_urlopen)
+        client = InferenceClient.from_endpoint(
+            base_url="http://127.0.0.1:8000/v1",
+            model="vision-model",
+            api_key="local",
+            backend="vllm",
+            context_size=32768,
+            default_max_tokens=4096,
+        )
+
+        result = client.chat(
+            "system",
+            "large prompt",
+            max_tokens=2048,
+            extra={"chat_template_kwargs": {"enable_thinking": False}},
+        )
+
+        assert result == "recovered"
+        assert [payload["max_tokens"] for payload in chat_payloads] == [2048, 2047]
+        assert tokenize_payloads == [{
+            "model": "vision-model",
+            "messages": chat_payloads[0]["messages"],
+            "chat_template_kwargs": {"enable_thinking": False},
+        }]
+
+    def test_vllm_context_retry_rejects_prompt_larger_than_context(self, monkeypatch):
+        from src.omlx_client import InferenceClient
+
+        client = InferenceClient.from_endpoint(
+            base_url="http://127.0.0.1:8000/v1",
+            model="vision-model",
+            api_key="local",
+            backend="vllm",
+            context_size=32768,
+        )
+        monkeypatch.setattr(client, "_tokenize_chat", lambda payload: (40012, 32768))
+        detail = json.dumps({
+            "error": {
+                "message": "This model's maximum context length is 32768 tokens.",
+                "param": "input_tokens",
+            },
+        })
+
+        with pytest.raises(RuntimeError, match="prompt uses 40,012 tokens"):
+            client._context_retry_payload({"max_tokens": 2048}, 400, detail)
+
 
 class TestCaptioner:
     """Test caption generation controls without contacting oMLX."""
@@ -377,6 +534,8 @@ class TestCaptioner:
         monkeypatch.setattr(captioner._client, "_post_chat", fake_post)
 
         assert captioner.caption(str(img_path)) == "visible caption"
+        assert captured["repetition_penalty"] == 1.05
+        assert captured["no_repeat_ngram_size"] == 12
         if disable_thinking:
             assert captured["chat_template_kwargs"] == {"enable_thinking": False}
         else:
@@ -574,6 +733,58 @@ class TestPipeline:
             "chat_template_kwargs": {"enable_thinking": False},
         }
 
+    def test_caption_chunks_budget_each_skewed_caption_in_order(self):
+        from src.pipeline import (
+            _chunk_captions_by_budget,
+            _compute_chunk_strategy,
+            _estimated_caption_tokens,
+        )
+
+        captions = [
+            {
+                "frame_id": i,
+                "timestamp_str": f"00:00:{i:02d}.000",
+                "caption": "x" * 3000,
+            }
+            for i in range(54)
+        ]
+        captions[20]["caption"] = "runaway `...`, " * 5000  # ~75K chars
+
+        strategy = _compute_chunk_strategy(captions, 32768)
+        chunks = _chunk_captions_by_budget(
+            captions,
+            strategy["safe_context_tokens"],
+        )
+
+        assert strategy["strategy"] == "hierarchical"
+        assert len(chunks) > 2
+        flattened = [item for chunk in chunks for item in chunk]
+        frame_ids = [item["frame_id"] for item in flattened]
+        assert frame_ids == sorted(frame_ids)
+        rebuilt = {i: "" for i in range(54)}
+        for item in flattened:
+            rebuilt[item["frame_id"]] += item["caption"]
+        assert [rebuilt[i] for i in range(54)] == [item["caption"] for item in captions]
+        assert all(
+            sum(_estimated_caption_tokens(item) for item in chunk)
+            <= strategy["safe_context_tokens"]
+            for chunk in chunks
+        )
+
+    def test_caption_chunks_split_one_caption_larger_than_budget(self):
+        from src.pipeline import _chunk_captions_by_budget, _estimated_caption_tokens
+
+        original = "0123456789" * 1500
+        chunks = _chunk_captions_by_budget(
+            [{"frame_id": 7, "timestamp_str": "00:00:07.000", "caption": original}],
+            1000,
+        )
+        pieces = [item for chunk in chunks for item in chunk]
+
+        assert len(pieces) > 1
+        assert "".join(item["caption"] for item in pieces) == original
+        assert all(_estimated_caption_tokens(item) <= 1000 for item in pieces)
+
     def test_reconstruction_synthesis_keeps_spark_context_headroom(self, monkeypatch):
         import src.reconstruct as reconstruct
 
@@ -599,6 +810,33 @@ class TestPipeline:
         assert result == "artifact"
         assert captured["max_tokens"] == 8192
         assert captured["max_tokens"] < 32768
+
+    def test_reconstruction_synthesis_splits_one_oversized_note(self, monkeypatch):
+        import src.reconstruct as reconstruct
+
+        calls = []
+
+        class LegacyClient:
+            _default_max_tokens = 32768
+
+        def fake_generate(client, system, user, *, max_tokens, temperature):
+            calls.append({"user": user, "max_tokens": max_tokens})
+            return f"condensed-{len(calls)}"
+
+        monkeypatch.setattr(reconstruct, "generate_text", fake_generate)
+
+        result = reconstruct._hierarchical_synthesize(
+            ["`...`, " * 18000],
+            "Rebuild the artifact.",
+            "Return only the artifact.",
+            LegacyClient(),
+            model_context=32768,
+        )
+
+        assert result.startswith("condensed-")
+        assert len(calls) >= 4
+        assert all(len(call["user"]) < 40000 for call in calls)
+        assert calls[-1]["max_tokens"] == 8192
 
     def test_ollama_caption_config_uses_direct_reconstruction_backend(self):
         import src.reconstruct as reconstruct
