@@ -78,12 +78,19 @@ class CaptioningConfig(BaseModel):
     ollama_base_url: str = Field(default="http://127.0.0.1:11434", description="Ollama API endpoint")
     # Shared generation settings
     temperature: float = Field(default=0.1, description="LLM temperature for captions")
-    max_tokens: int = Field(default=1024, description="Max tokens per caption")
+    max_tokens: int = Field(default=32768, description="Max tokens per caption")
     batch_size: int = Field(
         default=4,
         description=(
             "Frames per captioning chunk. For oMLX this is the number of concurrent "
             "OpenAI-compatible requests. Ignored by Ollama."
+        ),
+    )
+    disable_thinking: bool = Field(
+        default=True,
+        description=(
+            "Disable model reasoning for oMLX captions so Qwen-style models spend "
+            "their token budget on the visible answer instead of hidden thinking."
         ),
     )
     system_prompt: str = Field(

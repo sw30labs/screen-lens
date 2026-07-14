@@ -33,6 +33,8 @@ class TestConfig:
         config = ScreenLensConfig()
         assert config.captioning.backend == CaptionBackend.omlx
         assert config.captioning.omlx_base_url == "http://127.0.0.1:8000/v1"
+        assert config.captioning.disable_thinking is True
+        assert config.captioning.max_tokens == 32768
         assert config.frame_extraction.fps == 1.0
         assert config.embedding.device == "mps"
         assert config.vector_db.collection_name == "screenlens_frames"
@@ -180,6 +182,43 @@ class TestOMLXClient:
         user_content = captured["payload"]["messages"][1]["content"]
         assert user_content[0] == {"type": "text", "text": "describe"}
         assert user_content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+
+class TestCaptioner:
+    """Test caption generation controls without contacting oMLX."""
+
+    @pytest.mark.parametrize("disable_thinking", [True, False])
+    def test_omlx_captioner_controls_model_thinking(
+        self,
+        disable_thinking,
+        monkeypatch,
+        tmp_path,
+    ):
+        from PIL import Image
+        from src.captioner import OMLXCaptioner
+        from src.config import CaptioningConfig
+
+        img_path = tmp_path / "frame.jpg"
+        Image.new("RGB", (4, 4), color="blue").save(img_path)
+
+        config = CaptioningConfig(
+            omlx_model="vision-model",
+            disable_thinking=disable_thinking,
+        )
+        captioner = OMLXCaptioner(config)
+        captured = {}
+
+        def fake_post(payload):
+            captured.update(payload)
+            return "visible caption"
+
+        monkeypatch.setattr(captioner._client, "_post_chat", fake_post)
+
+        assert captioner.caption(str(img_path)) == "visible caption"
+        if disable_thinking:
+            assert captured["chat_template_kwargs"] == {"enable_thinking": False}
+        else:
+            assert "chat_template_kwargs" not in captured
 
 
 class TestEmbedder:

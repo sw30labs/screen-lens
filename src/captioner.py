@@ -34,12 +34,18 @@ class OMLXCaptioner:
 
     def caption(self, image_path: str) -> str:
         """Generate a caption for a single frame."""
+        extra = (
+            {"chat_template_kwargs": {"enable_thinking": False}}
+            if self.config.disable_thinking
+            else None
+        )
         return self._client.chat(
             self.config.system_prompt,
             self.config.user_prompt,
             images=[image_path],
             max_tokens=self.config.max_tokens,
             temperature=self.config.temperature,
+            extra=extra,
         )
 
     def caption_batch(self, image_paths: list[str]) -> list[str]:

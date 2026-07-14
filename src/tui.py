@@ -72,6 +72,7 @@ def _summary_rows(config: ScreenLensConfig, config_path: Path | None) -> list[tu
         ("Caption backend", config.captioning.backend.value),
         ("Model", _model_label(config)),
         ("Batch size", str(config.captioning.batch_size)),
+        ("Caption tokens", f"{config.captioning.max_tokens:,}"),
         ("oMLX URL", resolve_omlx_base_url(config.captioning)),
         ("oMLX key", _yes_no(bool(resolve_omlx_api_key(config.captioning)))),
         ("Embedding", f"{config.embedding.model_name} on {config.embedding.device}"),
