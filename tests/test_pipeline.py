@@ -129,6 +129,25 @@ class TestFrameExtractor:
         assert _format_timestamp(65.5) == "00:01:05.500"
         assert _format_timestamp(3661.123) == "01:01:01.123"
 
+    def test_missing_optional_ffprobe_uses_quiet_opencv_fallback(
+        self, monkeypatch, caplog,
+    ):
+        import logging
+        import src.frame_extractor as frame_extractor
+
+        monkeypatch.setattr(frame_extractor.shutil, "which", lambda command: None)
+        monkeypatch.setattr(
+            frame_extractor.subprocess,
+            "run",
+            lambda *args, **kwargs: pytest.fail("ffprobe should not be executed"),
+        )
+
+        with caplog.at_level(logging.INFO, logger="screenlens.frame_extractor"):
+            assert frame_extractor.get_video_metadata("video.mov") == {}
+
+        assert "reading video metadata with OpenCV" in caplog.text
+        assert not [record for record in caplog.records if record.levelno >= logging.WARNING]
+
     def test_resize_frame(self):
         from PIL import Image
         from src.frame_extractor import _resize_frame
@@ -501,6 +520,42 @@ class TestOMLXClient:
         with pytest.raises(RuntimeError, match="prompt uses 40,012 tokens"):
             client._context_retry_payload({"max_tokens": 2048}, 400, detail)
 
+    def test_required_complete_generation_rejects_length_finish(self, monkeypatch):
+        from src.omlx_client import InferenceClient, InferenceTruncatedError
+        import src.omlx_client as inference_client
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "choices": [{
+                        "message": {"content": "incomplete prefix"},
+                        "finish_reason": "length",
+                    }],
+                }).encode("utf-8")
+
+        monkeypatch.setattr(inference_client, "_urlopen", lambda req, timeout: FakeResponse())
+        client = InferenceClient.from_endpoint(
+            base_url="http://127.0.0.1:8000/v1",
+            model="vision-model",
+            api_key="local",
+            backend="vllm",
+            default_max_tokens=4096,
+        )
+
+        with pytest.raises(InferenceTruncatedError, match="incomplete output was discarded"):
+            client.chat(
+                "system",
+                "user",
+                max_tokens=2048,
+                require_complete=True,
+            )
+
 
 class TestCaptioner:
     """Test caption generation controls without contacting oMLX."""
@@ -544,6 +599,33 @@ class TestCaptioner:
 
 class TestEmbedder:
     """Test CLIP embedding generation."""
+
+    def test_public_hub_filter_only_suppresses_auth_advisory(self):
+        import logging
+        from src.embedder import _PublicHubAuthWarningFilter
+
+        auth_record = logging.LogRecord(
+            "huggingface_hub.utils._http",
+            logging.WARNING,
+            __file__,
+            1,
+            "Warning: You are sending unauthenticated requests to the HF Hub.",
+            (),
+            None,
+        )
+        failure_record = logging.LogRecord(
+            "huggingface_hub.utils._http",
+            logging.WARNING,
+            __file__,
+            1,
+            "Rate limited while downloading model weights.",
+            (),
+            None,
+        )
+
+        warning_filter = _PublicHubAuthWarningFilter()
+        assert warning_filter.filter(auth_record) is False
+        assert warning_filter.filter(failure_record) is True
 
     @pytest.fixture
     def embedder(self, monkeypatch):
@@ -785,7 +867,121 @@ class TestPipeline:
         assert "".join(item["caption"] for item in pieces) == original
         assert all(_estimated_caption_tokens(item) <= 1000 for item in pieces)
 
-    def test_reconstruction_synthesis_keeps_spark_context_headroom(self, monkeypatch):
+    def test_reconstruction_single_pass_extraction_uses_full_context_headroom(
+        self, monkeypatch,
+    ):
+        import src.reconstruct as reconstruct
+
+        calls = []
+
+        class LegacyClient:
+            _default_max_tokens = 32768
+
+        def fake_generate(client, system, user, *, max_tokens, temperature):
+            calls.append({"user": user, "max_tokens": max_tokens})
+            return "extracted detail"
+
+        monkeypatch.setattr(reconstruct, "generate_text", fake_generate)
+
+        result = reconstruct._extract_segment_notes(
+            [{
+                "frame_id": 0,
+                "timestamp_str": "00:00:00.000",
+                "caption": "A terminal displays app.py.",
+            }],
+            LegacyClient(),
+            model_context=32768,
+        )
+
+        assert result == ["[Full recording]\nextracted detail"]
+        assert [call["max_tokens"] for call in calls] == [32768]
+        assert "Keep the response at or below 1,400 tokens" in calls[0]["user"]
+
+    def test_reconstruction_multi_chunk_extraction_uses_full_context_headroom(
+        self, monkeypatch,
+    ):
+        import src.reconstruct as reconstruct
+
+        calls = []
+
+        class LegacyClient:
+            _default_max_tokens = 32768
+
+        def fake_generate(client, system, user, *, max_tokens, temperature):
+            calls.append({"user": user, "max_tokens": max_tokens})
+            return f"segment-{len(calls)}"
+
+        monkeypatch.setattr(reconstruct, "generate_text", fake_generate)
+        captions = [
+            {
+                "frame_id": i,
+                "timestamp_str": f"00:00:{i:02d}.000",
+                "caption": f"Frame {i} shows source code.",
+            }
+            for i in range(reconstruct.MAX_CAPTIONS_PER_CHUNK + 1)
+        ]
+
+        result = reconstruct._extract_segment_notes(
+            captions,
+            LegacyClient(),
+            model_context=32768,
+        )
+
+        assert len(result) == 2
+        assert len(calls) == 2
+        assert all(call["max_tokens"] == 32768 for call in calls)
+
+    def test_reconstruction_long_form_ceiling_tracks_larger_server_context(self):
+        import src.reconstruct as reconstruct
+
+        class ClientWithSmallerCaptionDefault:
+            _default_max_tokens = 32768
+
+        assert reconstruct._long_form_output_ceiling(
+            ClientWithSmallerCaptionDefault(),
+            262144,
+        ) == 262144
+
+    def test_reconstruction_extraction_splits_truncated_caption_group(
+        self, monkeypatch,
+    ):
+        import src.reconstruct as reconstruct
+        from src.omlx_client import InferenceTruncatedError
+
+        calls = []
+
+        def fake_generate(client, system, user, *, max_tokens, temperature):
+            calls.append(user)
+            if len(calls) == 1:
+                raise InferenceTruncatedError("vllm", max_tokens)
+            return f"bounded-{len(calls)}"
+
+        monkeypatch.setattr(reconstruct, "generate_text", fake_generate)
+        captions = [
+            {
+                "frame_id": i,
+                "timestamp_str": f"00:00:0{i}.000",
+                "caption": f"Frame {i} source code.",
+            }
+            for i in range(4)
+        ]
+
+        result = reconstruct._extract_segment_notes(
+            captions,
+            object(),
+            model_context=32768,
+        )
+
+        assert len(calls) == 3
+        assert len(result) == 2
+        assert result[0].startswith("[Segment 1a:")
+        assert result[1].startswith("[Segment 1b:")
+        assert len(calls[1]) < len(calls[0])
+        assert len(calls[2]) < len(calls[0])
+
+    def test_reconstruction_synthesis_uses_full_ceiling_after_planning_headroom(
+        self, monkeypatch,
+    ):
         import src.reconstruct as reconstruct
 
         captured = {}
@@ -794,6 +990,7 @@ class TestPipeline:
             _default_max_tokens = 32768
 
         def fake_generate(client, system, user, *, max_tokens, temperature):
+            captured["user"] = user
             captured["max_tokens"] = max_tokens
             return "artifact"
 
@@ -808,22 +1005,38 @@ class TestPipeline:
         )
 
         assert result == "artifact"
-        assert captured["max_tokens"] == 8192
-        assert captured["max_tokens"] < 32768
+        assert reconstruct._estimated_text_tokens(captured["user"]) < 32768 - 8192
+        assert captured["max_tokens"] == 32768
 
     def test_reconstruction_synthesis_splits_one_oversized_note(self, monkeypatch):
         import src.reconstruct as reconstruct
 
         calls = []
+        chunk_budgets = []
 
         class LegacyClient:
             _default_max_tokens = 32768
 
         def fake_generate(client, system, user, *, max_tokens, temperature):
-            calls.append({"user": user, "max_tokens": max_tokens})
+            calls.append({
+                "system": system,
+                "user": user,
+                "max_tokens": max_tokens,
+            })
             return f"condensed-{len(calls)}"
 
+        real_chunk_texts = reconstruct._chunk_texts_by_budget
+
+        def capture_chunk_budget(items, token_budget):
+            chunk_budgets.append(token_budget)
+            return real_chunk_texts(items, token_budget)
+
         monkeypatch.setattr(reconstruct, "generate_text", fake_generate)
+        monkeypatch.setattr(
+            reconstruct,
+            "_chunk_texts_by_budget",
+            capture_chunk_budget,
+        )
 
         result = reconstruct._hierarchical_synthesize(
             ["`...`, " * 18000],
@@ -836,7 +1049,91 @@ class TestPipeline:
         assert result.startswith("condensed-")
         assert len(calls) >= 4
         assert all(len(call["user"]) < 40000 for call in calls)
-        assert calls[-1]["max_tokens"] == 8192
+        assert 2048 < chunk_budgets[0] < 32768 - 2548
+
+        intermediate_calls = [
+            call for call in calls
+            if call["system"] == reconstruct.EXTRACT_SEGMENT_SYSTEM
+        ]
+        assert all("TASK FOCUS:\nRebuild the artifact." in call["user"]
+                   for call in intermediate_calls)
+        assert all("discard material solely about other files/artifacts" in call["user"]
+                   for call in intermediate_calls)
+        assert all(call["max_tokens"] == 32768 for call in intermediate_calls)
+        assert calls[-1]["max_tokens"] == 32768
+
+    def test_reconstruction_synthesis_retries_truncated_group_with_less_input(
+        self, monkeypatch,
+    ):
+        import src.reconstruct as reconstruct
+        from src.omlx_client import InferenceTruncatedError
+
+        calls = []
+        truncated_once = False
+
+        class LegacyClient:
+            _default_max_tokens = 32768
+
+        def fake_generate(client, system, user, *, max_tokens, temperature):
+            nonlocal truncated_once
+            calls.append({
+                "system": system,
+                "user": user,
+                "max_tokens": max_tokens,
+            })
+            if system == reconstruct.EXTRACT_SEGMENT_SYSTEM and not truncated_once:
+                truncated_once = True
+                raise InferenceTruncatedError("vllm", max_tokens)
+            return "focused bounded notes"
+
+        monkeypatch.setattr(reconstruct, "generate_text", fake_generate)
+
+        result = reconstruct._hierarchical_synthesize(
+            ["agent.py exact source detail " * 2400],
+            "Reconstruct agent.py only.",
+            "Return only agent.py.",
+            LegacyClient(),
+            model_context=32768,
+        )
+
+        intermediate_calls = [
+            call for call in calls
+            if call["system"] == reconstruct.EXTRACT_SEGMENT_SYSTEM
+        ]
+        assert result == "focused bounded notes"
+        assert len(intermediate_calls) >= 3
+        assert len(intermediate_calls[1]["user"]) < len(intermediate_calls[0]["user"])
+        assert "TASK FOCUS:\nReconstruct agent.py only." in intermediate_calls[1]["user"]
+
+    def test_reconstruction_synthesis_stops_when_condensation_makes_no_progress(
+        self, monkeypatch,
+    ):
+        import src.reconstruct as reconstruct
+
+        calls = []
+
+        class LegacyClient:
+            _default_max_tokens = 32768
+
+        def fake_generate(client, system, user, *, max_tokens, temperature):
+            calls.append({"user": user, "max_tokens": max_tokens})
+            # Deliberately violate the requested compression contract. The
+            # recursion guard must reject this instead of calling itself until
+            # Python raises RecursionError.
+            return "not-condensed " * 4000
+
+        monkeypatch.setattr(reconstruct, "generate_text", fake_generate)
+
+        with pytest.raises(RuntimeError, match="(?i)(progress|condens)"):
+            reconstruct._hierarchical_synthesize(
+                ["first detail " * 2500, "second detail " * 2500],
+                "Rebuild the artifact.",
+                "Return only the artifact.",
+                LegacyClient(),
+                model_context=32768,
+            )
+
+        assert 1 <= len(calls) <= 4
 
     def test_ollama_caption_config_uses_direct_reconstruction_backend(self):
         import src.reconstruct as reconstruct

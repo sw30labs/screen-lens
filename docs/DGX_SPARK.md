@@ -10,27 +10,41 @@ Silicon/oMLX workflow.
   `http://127.0.0.1:8000/v1`.
 - ScreenLens runs in `.venv-dgx` with Python 3.12, CUDA 13 PyTorch, and CUDA
   OpenCLIP embeddings.
-- The default `nvidia/Qwen3.6-35B-A3B-NVFP4` checkpoint is multimodal: one
-  served model handles frame captioning, verbatim OCR, and text reconstruction.
+- The default `nvidia/Qwen3.6-27B-NVFP4` checkpoint is a dense multimodal model:
+  one served model handles frame captioning, verbatim OCR, and text reconstruction.
 - Hugging Face downloads and vLLM compilation caches persist outside the
   container and can be shared with another project.
 
 When ScreenLens starts its own service, the model revision is pinned to
-`491c2f1ea524c639598bf8fa787a93fed5a6fbce` and the validated vLLM image is
-digest-pinned. The server limits context to 32K, admits at most two sequences,
-and targets 20% GPU memory so image inference, OpenCLIP, the operating system,
-and other local workloads share the DGX Spark's 128 GB unified-memory pool
-safely.
+`0893e1606ff3d5f97a441f405d5fc541a6bdf404` and the validated vLLM image is
+digest-pinned. The server exposes the model's native 262,144-token context,
+admits at most two sequences, and targets 45% GPU memory so the long FP8 KV
+cache fits while leaving unified memory for image inference, OpenCLIP, the
+operating system, and other local workloads.
 
 ScreenLens requests captions with a 32K output ceiling. Prompt, chat-template,
-image, and completion tokens share the server's 32K context, so a literal
-`max_tokens=32768` would reserve zero input space and fail. At that ceiling the
-client omits `max_tokens`; vLLM then assigns the exact context remaining after
-the input instead of truncating every caption at the former 4K client cap.
+image, and completion tokens share the server's 262K context, so the caption
+limit leaves substantial input headroom. If `VLLM_MAX_MODEL_LEN` is deliberately
+reduced to the same 32K value, the client omits `max_tokens`; vLLM then assigns
+the exact context remaining after the input instead of making an impossible
+zero-input reservation.
 Direct captions also use light repetition controls so a malformed generation
 cannot consume that entire ceiling by looping. Later reconstruction stages
 greedily pack captions by serialized size and split an individually oversized
 caption; they do not assume every frame caption is near the global average.
+The shared extraction pass requests at most 1,400 output tokens while retaining
+the server's entire context as completion headroom. Recursive synthesis filters
+notes to the current file or artifact and uses the same full ceiling. A group
+that still ends with `finish_reason=length` is discarded and retried with less
+input; incomplete prefixes never flow into later passes. If the endpoint and
+`VLLM_MAX_MODEL_LEN` are upgraded together, reconstruction automatically uses a
+larger served context such as Qwen3.6's native 262K window.
+
+The service uses Qwen's built-in `mtp` speculative method with two draft
+tokens. MTP is lossless speculative decoding: it changes throughput, not the
+model's answer or context limit. DFlash is intentionally absent because it
+requires an additional draft checkpoint and does not solve completion-length
+failures.
 
 ## Sharing vLLM with DigitalTwin
 
@@ -71,7 +85,7 @@ The checked configuration expects:
 - CUDA 13 and a working `nvidia-smi`
 - Docker Engine, the Compose plugin, and NVIDIA Container Toolkit
 - Python 3.12 with `venv` support
-- ffmpeg/ffprobe recommended for complete video metadata (OpenCV is the fallback)
+- ffmpeg/ffprobe recommended for complete video metadata (a missing binary uses the quiet OpenCV fallback)
 - approximately 70 GiB of free disk for a first container/model download
 - outbound HTTPS to Docker Hub, Hugging Face, and Python package indexes
 - a Hugging Face read token when this repository must start vLLM
@@ -194,12 +208,12 @@ values take precedence.
 | `DGX_HF_CACHE` | `.local-models/huggingface` | Persistent vLLM and OpenCLIP Hugging Face cache |
 | `DGX_VLLM_CACHE` | `.local-models/vllm` | Persistent compilation/runtime cache |
 | `VLLM_IMAGE` | validated `vllm/vllm-openai@sha256:…` digest | ARM64 vLLM image; override deliberately when validating an upgrade |
-| `VLLM_MODEL` | `nvidia/Qwen3.6-35B-A3B-NVFP4` | Served and requested multimodal model id |
+| `VLLM_MODEL` | `nvidia/Qwen3.6-27B-NVFP4` | Served and requested dense multimodal model id |
 | `VLLM_MODEL_REVISION` | pinned SHA above | Reproducible model contents |
 | `VLLM_BASE_URL` | `http://127.0.0.1:8000/v1` | OpenAI-compatible API root |
 | `VLLM_API_KEY` | `local` | Placeholder for loopback, or bearer token for an externally authenticated endpoint |
-| `VLLM_GPU_MEMORY_UTILIZATION` | `0.2` | vLLM allocator target for unified memory |
-| `VLLM_MAX_MODEL_LEN` | `32768` | Serving limit and Python prompt-planning context |
+| `VLLM_GPU_MEMORY_UTILIZATION` | `0.45` | vLLM allocator target sized for the long FP8 KV cache |
+| `VLLM_MAX_MODEL_LEN` | `262144` | Native serving limit and Python prompt-planning context |
 | `VLLM_START_TIMEOUT` | `1800` | Readiness timeout in seconds |
 | `VLLM_LOG_TAIL` | `200` | Initial line count for `llm-logs` |
 
@@ -210,10 +224,11 @@ LAN or Internet; use an authenticated TLS reverse proxy for remote access.
 ## Memory and performance notes
 
 DGX Spark memory is unified, not 128 GB of VRAM plus separate system RAM. In the
-DigitalTwin validation of this exact recipe, a `0.2` allocator target still
-produced roughly 44.6 GiB of vLLM process residency, while `0.4` reached about
-67.5 GiB and caused swap pressure with a second model. Keep `0.2`, 32K context,
-and two sequences until the complete ScreenLens workload has been measured.
+The checked recipe runs one dense NVFP4 model rather than keeping a separate
+draft or second large model resident. Its `0.45` allocator target is deliberate:
+the 262K window needs a substantially larger FP8 KV cache than the former 32K
+service. Keep concurrency at two, and lower the allocator or context together
+if other sustained GPU workloads must share the host.
 
 Integrated-GPU memory fields may appear unavailable in `nvidia-smi`. Use
 `free -h`, the DGX Dashboard, and per-process measurements for the shared pool.
@@ -225,13 +240,15 @@ Integrated-GPU memory fields may appear unavailable in `nvidia-smi`. Use
 | Docker permission denied | Add the user to the Docker group, log out/in, and rerun `doctor` |
 | NVIDIA runtime missing | Configure it with `nvidia-ctk`, restart Docker, and validate GPU passthrough |
 | `HF_TOKEN` missing | Add a read token to mode-600 `.env`; it is unnecessary only when reusing a ready service |
+| Public OpenCLIP weights load without `HF_TOKEN` | Supported; ScreenLens hides only the unauthenticated-download advisory while surfacing real Hub failures |
+| Reconstruction exhausts the served context | The incomplete prefix is discarded automatically and the input group is split; a final failure means one minimum-size group still cannot fit even with the full served context |
 | Hugging Face Xet/CAS returns 401 | Keep `HF_HUB_DISABLE_XET=1`; standard Hub HTTP resumes partial downloads |
 | Port 8000 has another model | Stop/reconfigure its owner or set `VLLM_BASE_URL`; ScreenLens will not replace it |
 | First startup appears stalled | Follow the owning stack's logs and allow the 1,800-second model/compile timeout |
 | PyTorch reports no CUDA | Rerun `setup`; do not replace the `+cu130` ARM64 wheels with PyPI CPU wheels |
 | `pip check` reports the known cuSPARSELt SBSA tag | The helper accepts only that exact warning after successful real CUDA/OpenCLIP operations |
 | Vision smoke omits `test.mov` | Confirm the exact multimodal model and inspect vLLM logs; a text-only or mismatched service is not valid |
-| Out of memory or heavy swap | Stop competing workloads and retain utilization `0.2`, 32K context, and concurrency two |
+| Out of memory or heavy swap | Stop competing workloads first; otherwise reduce `VLLM_GPU_MEMORY_UTILIZATION` and `VLLM_MAX_MODEL_LEN` together while retaining concurrency two |
 
 ## Apple Silicon remains supported
 

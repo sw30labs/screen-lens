@@ -24,7 +24,7 @@ platform_defaults:
     embedding_device: "cuda"
     image_concurrency: 2
     caption_max_tokens: 32768
-    model: "nvidia/Qwen3.6-35B-A3B-NVFP4"
+    model: "nvidia/Qwen3.6-27B-NVFP4"
   apple_silicon:
     match:
       system: "Darwin"
@@ -46,9 +46,9 @@ configs:
     captioning:
       backend: "vllm"
       vllm_base_url: "http://127.0.0.1:8000/v1"
-      vllm_model: "nvidia/Qwen3.6-35B-A3B-NVFP4"
+      vllm_model: "nvidia/Qwen3.6-27B-NVFP4"
       vllm_api_key: "local"
-      vllm_model_context: 32768
+      vllm_model_context: 262144
       max_tokens: 32768
       batch_size: 2
     embedding:
@@ -57,12 +57,12 @@ configs:
     ocr:
       backend: "vllm"
       base_url: "http://127.0.0.1:8000/v1"
-      model: "nvidia/Qwen3.6-35B-A3B-NVFP4"
+      model: "nvidia/Qwen3.6-27B-NVFP4"
       concurrency: 2
     reconstruction:
       backend: "vllm"
       base_url: "http://127.0.0.1:8000/v1"
-      model: "nvidia/Qwen3.6-35B-A3B-NVFP4"
+      model: "nvidia/Qwen3.6-27B-NVFP4"
 
   apple_fast:
     description: "Small native Apple ingestion using the model configured in MLX_MODEL/OMLX_MODEL"
@@ -130,7 +130,7 @@ test_cases:
     expected:
       exit_code: 0
       output_contains:
-        - "nvidia/Qwen3.6-35B-A3B-NVFP4"
+        - "nvidia/Qwen3.6-27B-NVFP4"
         - "yes (vision)"
 
   - id: "TC-DGX-004"
@@ -204,14 +204,14 @@ test_cases:
     command: >-
       ./setup_and_run_dgx.sh run transcribe "{video_file}"
       --backend vllm
-      --inference-model nvidia/Qwen3.6-35B-A3B-NVFP4
+      --inference-model nvidia/Qwen3.6-27B-NVFP4
       --sample-fps 0.5
     timeout_seconds: 900
     expected:
       exit_code: 0
       output_contains:
         - "ScreenLens — Verbatim Transcription"
-        - "OCR (vision): nvidia/Qwen3.6-35B-A3B-NVFP4"
+        - "OCR (vision): nvidia/Qwen3.6-27B-NVFP4"
         - "Done in"
       data_created_relative_to_output:
         - "ocr/all_ocr.json"

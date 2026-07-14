@@ -29,7 +29,7 @@ logger = logging.getLogger("screenlens.inference")
 
 DEFAULT_OMLX_BASE_URL = "http://127.0.0.1:8000/v1"
 DEFAULT_VLLM_BASE_URL = "http://127.0.0.1:8000/v1"
-DEFAULT_VLLM_MODEL = "nvidia/Qwen3.6-35B-A3B-NVFP4"
+DEFAULT_VLLM_MODEL = "nvidia/Qwen3.6-27B-NVFP4"
 DEFAULT_VLLM_CONTEXT = 32768
 _VLLM_CONTEXT_ERROR_PARAMS = {"input_tokens", "input_text"}
 _TOKENIZE_CHAT_FIELDS = {
@@ -84,6 +84,18 @@ _KNOWN_VISION_PATTERNS = (
 # NOT flagged), via is_draft_model().
 _DRAFT_MARKERS = ("dflash", "draft", "eagle")
 _DRAFT_RE = re.compile(r"(^|-)mtp(-|$)")
+
+
+class InferenceTruncatedError(RuntimeError):
+    """Raised when a caller requires a complete generation but receives a prefix."""
+
+    def __init__(self, backend: str, completion_limit: int | str):
+        self.backend = backend
+        self.completion_limit = completion_limit
+        super().__init__(
+            f"{backend} truncated the response at {completion_limit} "
+            "(finish_reason=length); incomplete output was discarded"
+        )
 
 
 def is_draft_model(model_id: str | None) -> bool:
@@ -491,6 +503,7 @@ class OpenAICompatibleClient:
         max_tokens: int | None = None,
         temperature: float | None = None,
         extra: dict[str, Any] | None = None,
+        require_complete: bool = False,
     ) -> str:
         if images:
             validate_vision_model(self.model)
@@ -532,6 +545,10 @@ class OpenAICompatibleClient:
         # etc.). Both the bundled vLLM recipe and current oMLX accept these.
         if extra:
             payload.update({k: v for k, v in extra.items() if v is not None})
+        if require_complete:
+            return strip_thinking(
+                self._post_chat(payload, require_complete=True)
+            )
         return strip_thinking(self._post_chat(payload))
 
     def _tokenize_url(self) -> str:
@@ -637,6 +654,7 @@ class OpenAICompatibleClient:
         payload: dict[str, Any],
         *,
         allow_context_retry: bool = True,
+        require_complete: bool = False,
     ) -> str:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -660,6 +678,7 @@ class OpenAICompatibleClient:
                     return self._post_chat(
                         retry_payload,
                         allow_context_retry=False,
+                        require_complete=require_complete,
                     )
             hint = ""
             if exc.code == 401:
@@ -692,17 +711,17 @@ class OpenAICompatibleClient:
                 completion_limit = (
                     f"remaining space in the {self.context_size}-token context"
                 )
-                remedy = "the model context limit"
-            else:
-                remedy = "max_tokens without exceeding the model context"
+            if require_complete:
+                raise InferenceTruncatedError(
+                    self.backend.value,
+                    completion_limit,
+                )
             logger.warning(
-                "%s truncated the response at %s (finish_reason=length). "
-                "For a reasoning model this usually means it ran out of budget mid-"
-                "thought and never reached the answer — disable thinking or raise "
-                "%s.",
+                "%s truncated the response at %s (finish_reason=length); "
+                "the returned text may be incomplete. Reduce the prompt or "
+                "increase the completion budget within the model context.",
                 self.backend.value,
                 completion_limit,
-                remedy,
             )
         if isinstance(first, dict):
             if "message" in first and isinstance(first["message"], dict):

@@ -37,7 +37,7 @@ Use provider-neutral direct-inference flags; provider-specific spellings remain 
 
 ```bash
 python -m src.cli ingest "video.mov" --backend vllm \
-  --inference-model nvidia/Qwen3.6-35B-A3B-NVFP4 \
+  --inference-model nvidia/Qwen3.6-27B-NVFP4 \
   --device cuda --batch-size 2
 ```
 

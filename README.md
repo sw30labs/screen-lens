@@ -39,7 +39,7 @@ The vLLM and oMLX paths share the same small OpenAI-compatible client, including
 | Component | Technology | Purpose |
 |---|---|---|
 | Frame extraction | Hybrid SSIM + pHash + HSV detection | Capture distinct screens while bounding long static intervals |
-| DGX vision/text | `nvidia/Qwen3.6-35B-A3B-NVFP4` via vLLM | Caption frames, perform OCR, summarize, and reconstruct through one local model |
+| DGX vision/text | `nvidia/Qwen3.6-27B-NVFP4` via vLLM | Caption frames, perform OCR, summarize, and reconstruct through one dense local model |
 | Apple vision/text | Configured multimodal model via oMLX | Native Apple Silicon OpenAI-compatible inference |
 | Optional fallback | Ollama | Alternative captioning and summarization when explicitly selected |
 | Visual embeddings | OpenCLIP ViT-B-32 | Semantic image/text vectors on CUDA, MPS, or CPU |
@@ -55,7 +55,7 @@ The vLLM and oMLX paths share the same small OpenAI-compatible client, including
 | Darwin ARM64 / Apple Silicon | oMLX | MPS | 4 |
 | Other hosts | oMLX unless overridden | CPU | 4 |
 
-Caption output is capped at 4,096 tokens by default. This leaves room for the image and prompt inside the bundled Spark service's 32K total context window.
+Caption output is capped at 32,768 tokens by default. The bundled dense Spark service exposes a 262,144-token total context, leaving ample prompt and image-token headroom while reconstruction can use the full served window.
 
 ## Installation
 
@@ -115,7 +115,7 @@ Commands that contact the direct inference service accept provider-neutral flags
 python -m src.cli ingest video.mov \
   --backend vllm \
   --inference-url http://127.0.0.1:8000/v1 \
-  --inference-model nvidia/Qwen3.6-35B-A3B-NVFP4 \
+  --inference-model nvidia/Qwen3.6-27B-NVFP4 \
   --inference-api-key local \
   --device cuda \
   --batch-size 2
@@ -226,7 +226,11 @@ All settings live in `src/config.py` as Pydantic models. Key parameters:
 
 Direct backends receive one OpenAI-compatible image request per frame. Image encoding and prompt prefill usually dominate short captions, so the main levers are frame dimensions, model size, and request concurrency. The bundled Spark service admits two sequences and ScreenLens therefore defaults to two requests there. Apple defaults to four, but large oMLX models may benefit from a lower value.
 
-DGX Spark has one 128 GB unified-memory pool rather than separate system RAM and VRAM. Keep the checked vLLM allocator target at `0.2`, the 32K context, and concurrency two until the complete workload has been measured. Caption requests use a 32K output ceiling; because input and output share that window, ScreenLens omits the literal limit and lets vLLM allocate all tokens remaining after the prompt and image. Reconstruction groups captions by serialized size rather than frame count, so an unusually long caption cannot overfill a later prompt. See [the Spark memory notes](docs/DGX_SPARK.md#memory-and-performance-notes).
+DGX Spark has one 128 GB unified-memory pool rather than separate system RAM and VRAM. The checked single-service recipe uses the dense NVFP4 27B model, a `0.45` vLLM allocator target, a 262K context, and concurrency two. Caption requests retain a 32K output ceiling, leaving the rest of the served window for prompt, chat-template, and image tokens. If a service is deliberately reduced to a matching 32K context, ScreenLens omits the literal output limit and lets vLLM allocate the exact context remaining after its input.
+
+Reconstruction groups captions by serialized size rather than frame count, so an unusually long caption cannot overfill a later prompt. Its shared extraction pass requests dense notes under 1,400 tokens but gives the model the full context exposed by the server as completion headroom. Recursive synthesis filters notes to the file or artifact currently being rebuilt and uses that same full ceiling. If a response still ends with `finish_reason=length`, ScreenLens discards the incomplete prefix and retries a smaller input group. The 262K service context is therefore used automatically when `VLLM_MAX_MODEL_LEN` matches it. Native two-token Qwen MTP accelerates decoding without changing answers; DFlash is not loaded because it would add a second draft model and does not increase context or output quality. See [the Spark memory notes](docs/DGX_SPARK.md#memory-and-performance-notes).
+
+`ffprobe` remains optional: when it is absent, video metadata is read through OpenCV without a warning. OpenCLIP's checked checkpoint is public, so ScreenLens suppresses only the Hub's unauthenticated-download advisory; actual authorization, rate-limit, and download failures remain visible. A Hugging Face token is still required when the DGX helper must start the gated vLLM model service.
 
 ## Project Structure
 

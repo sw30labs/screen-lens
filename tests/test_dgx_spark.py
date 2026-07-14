@@ -112,7 +112,10 @@ def test_compose_recipe_is_loopback_only_and_bounded():
     assert '"127.0.0.1:8000:8000"' in compose
     assert "platform: linux/arm64" in compose
     assert "vllm/vllm-openai@sha256:" in compose
-    assert "nvidia/Qwen3.6-35B-A3B-NVFP4" in compose
+    assert "nvidia/Qwen3.6-27B-NVFP4" in compose
+    assert '"${VLLM_MAX_MODEL_LEN:-262144}"' in compose
+    assert '"method":"mtp"' in compose
+    assert "--moe-backend" not in compose
     assert "--max-num-seqs" in compose
     assert '      - "2"' in compose
 

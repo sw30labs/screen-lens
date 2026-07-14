@@ -20,7 +20,7 @@ python -m src.cli ingest "video.mov" --backend ollama --strategy fixed_fps --fps
 
 # Provider-neutral direct inference flags; --vllm-* and --omlx-* are aliases
 python -m src.cli ingest "video.mov" --backend vllm \
-  --inference-model nvidia/Qwen3.6-35B-A3B-NVFP4 --device cuda --batch-size 2
+  --inference-model nvidia/Qwen3.6-27B-NVFP4 --device cuda --batch-size 2
 
 # Batch-ingest a folder (each video gets its own ./data/<slug>/ collection)
 python -m src.cli batch "/path/to/recordings/"
@@ -118,7 +118,7 @@ Key mechanics worth knowing before editing:
 - **Thinking is disabled for OCR and cleanup.** Both pass `chat_template_kwargs={"enable_thinking": false}` (gated by `OCRConfig.disable_thinking` / `ReconstructionConfig.disable_thinking`, default true). A reasoning model used for verbatim OCR otherwise spends the entire `max_tokens` budget on chain-of-thought and never emits the transcription. `omlx_client.strip_thinking` also strips complete/dangling `<think>` blocks, and `_post_chat` warns on `finish_reason == "length"`.
 - **Cleanup is OFF by default** (`ReconstructionConfig.enabled = False`; CLI opt-in via `--cleanup`). The raw stitched OCR is already verbatim; an LLM tends to drop content while "repairing".
 - **Cleanup coverage guard.** When cleanup runs, chunk input is bounded by the output token cap (not just the context window) so a chunk can't truncate mid-output. After each chunk, `_chunk_coverage` checks the fraction of distinct input lines that survived; below `MIN_CHUNK_COVERAGE` (0.97) the LLM output is discarded and the **raw stitched chunk is kept** — `transcript.md` can never lose content vs. `transcript.raw.md`.
-- **Role-specific model resolution.** On Spark, OCR and cleanup default to the single `VLLM_MODEL` (`nvidia/Qwen3.6-35B-A3B-NVFP4`). On Apple, OCR and cleanup retain their `OCR_MODEL` and `LLM_MODEL`/`MLX_MODEL` resolution. Each role gets a separately configured `InferenceClient` built via `from_endpoint`.
+- **Role-specific model resolution.** On Spark, OCR and cleanup default to the single `VLLM_MODEL` (`nvidia/Qwen3.6-27B-NVFP4`). On Apple, OCR and cleanup retain their `OCR_MODEL` and `LLM_MODEL`/`MLX_MODEL` resolution. Each role gets a separately configured `InferenceClient` built via `from_endpoint`.
 
 ### Configuration (`src/config.py`)
 
