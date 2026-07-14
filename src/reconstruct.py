@@ -26,8 +26,8 @@ from typing import Annotated, Optional, TypedDict
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 
-from .config import ScreenLensConfig
-from .omlx_client import OMLXClient, resolve_omlx_model
+from .config import CaptionBackend, ScreenLensConfig
+from .omlx_client import InferenceClient
 # Reuse the chunk-strategy math from the summarization pipeline. It's the same
 # token-budget problem (fit a long caption stream into a fixed model context),
 # so we deliberately share the helper rather than duplicate the constants.
@@ -242,33 +242,61 @@ class ReconstructState(TypedDict, total=False):
 _MODEL_CACHE: dict = {}
 
 
-def get_inference_client(config: ScreenLensConfig) -> OMLXClient:
-    """Create/cache the configured oMLX client for reuse across all nodes."""
+def _reconstruction_captioning_config(config: ScreenLensConfig):
+    """Return a direct-provider config even when captions came from Ollama."""
+    captioning = config.captioning
+    if captioning.backend != CaptionBackend.ollama:
+        return captioning
+
+    direct = captioning.model_copy(deep=True)
+    reconstruction = config.reconstruction
+    direct.backend = CaptionBackend(reconstruction.backend.value)
+    direct.max_tokens = reconstruction.max_tokens
+    if direct.backend == CaptionBackend.vllm:
+        direct.vllm_base_url = reconstruction.base_url
+        direct.vllm_model = reconstruction.model
+        direct.vllm_api_key = reconstruction.api_key
+        direct.vllm_timeout_seconds = reconstruction.timeout_seconds
+        direct.vllm_model_context = reconstruction.model_context
+    else:
+        direct.omlx_base_url = reconstruction.base_url
+        direct.omlx_model = reconstruction.model
+        direct.omlx_api_key = reconstruction.api_key
+        direct.omlx_timeout_seconds = reconstruction.timeout_seconds
+        direct.omlx_model_context = reconstruction.model_context
+    return direct
+
+
+def get_inference_client(config: ScreenLensConfig) -> InferenceClient:
+    """Create/cache the configured direct client for reuse across all nodes."""
+    direct_config = _reconstruction_captioning_config(config)
+    client = InferenceClient(direct_config)
     key = (
-        "omlx",
-        config.captioning.omlx_base_url,
-        resolve_omlx_model(config.captioning),
+        client.backend.value,
+        client.base_url,
+        client.model,
+        client.api_key,
     )
     if key not in _MODEL_CACHE:
-        client = OMLXClient(config.captioning)
-        print(f"Using oMLX model: {client.model} at {client.base_url}")
+        print(f"Using {client.backend.value} model: {client.model} at {client.base_url}")
         _MODEL_CACHE[key] = client
     return _MODEL_CACHE[key]
 
 
 def generate_text(
-    client: OMLXClient,
+    client: InferenceClient,
     system: str,
     user: str,
     max_tokens: int = 4096,
     temperature: float = 0.2,
 ) -> str:
-    """Generate text using the configured oMLX client."""
+    """Generate text using the configured direct inference client."""
     return client.chat(
         system,
         user,
         max_tokens=max_tokens,
         temperature=temperature,
+        extra={"chat_template_kwargs": {"enable_thinking": False}},
     )
 
 
@@ -339,8 +367,8 @@ def _chunk_list(items: list, chunk_size: int) -> list[list]:
 
 
 def _get_model_context_size(client) -> int:
-    """Return the configured oMLX context window used for chunk planning."""
-    return client.config.omlx_model_context
+    """Return the configured context window used for chunk planning."""
+    return client.context_size
 
 
 def _extract_segment_notes(
@@ -351,7 +379,7 @@ def _extract_segment_notes(
     """Pass 1 of hierarchical reconstruction: extract content notes per chunk.
 
     Uses ``_compute_chunk_strategy`` to size chunks against the model's
-    context window. Each chunk gets a single oMLX call producing structured
+    context window. Each chunk gets a single inference call producing structured
     extraction notes (raw content, no synthesis). The result is a list of
     notes — one per chunk — that downstream synthesis passes consume.
 
@@ -426,7 +454,7 @@ def _hierarchical_synthesize(
     task_system_prompt: str,
     client,
     model_context: int,
-    max_output_tokens: int = 32768,
+    max_output_tokens: int | None = None,
 ) -> str:
     """Pass 2 of hierarchical reconstruction: synthesize segment notes into a
     final artifact, recursing if the notes don't all fit in one call.
@@ -439,6 +467,17 @@ def _hierarchical_synthesize(
     token count (by collapsing several detailed notes into one denser note).
     """
     OVERHEAD_TOKENS = 2548  # system prompt + chat template + safety margin
+    if max_output_tokens is None:
+        # A legacy ScreenLens config may still carry the old 32K generation
+        # default. Reserving the entire 32K Spark context for output leaves no
+        # room for the system prompt or extraction notes and vLLM rejects the
+        # request. Respect smaller configured values while keeping at least
+        # three quarters of the context available for input and overhead.
+        configured_output = int(getattr(client, "_default_max_tokens", 4096))
+        max_output_tokens = max(
+            256,
+            min(configured_output, max(256, model_context // 4)),
+        )
     safe_input_tokens = max(
         2048,
         int((model_context - OVERHEAD_TOKENS - max_output_tokens) * 0.85),
@@ -956,7 +995,7 @@ def route_to_workers(state: ReconstructState):
     """Dispatch reconstruction tasks sequentially.
 
     Keep reconstruction deterministic by processing tasks in order. The
-    expensive work is delegated to the oMLX server, which handles its own
+    expensive work is delegated to the inference server, which handles its own
     scheduling and batching.
     """
     tasks = state.get("reconstruction_tasks", [])

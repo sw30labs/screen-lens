@@ -3,7 +3,7 @@ LangGraph ScreenLens Pipeline.
 
 Orchestrates the full ScreenLens workflow:
   1. Ingest — extract keyframes from video (hybrid change detection)
-  2. Caption — generate dense captions (Qwen3.5-VL via oMLX or Ollama)
+  2. Caption — generate dense captions (vLLM, oMLX, or Ollama)
   3. Embed — generate CLIP embeddings for semantic search
   4. Store — persist embeddings + metadata in ChromaDB
   5. Search — semantic query (text → CLIP → vector search)
@@ -21,7 +21,11 @@ from .config import ScreenLensConfig
 from .frame_extractor import extract_frames, get_video_metadata
 from .captioner import caption_frames
 from .embedder import CLIPEmbedder
-from .omlx_client import OMLXClient, resolve_omlx_model
+from .omlx_client import (
+    InferenceClient,
+    resolve_inference_context,
+    resolve_inference_model,
+)
 from .vector_store import ScreenLensVectorStore
 
 
@@ -95,8 +99,8 @@ def caption_node(state: ScreenLensState) -> dict:
     output_dir = str(config.data_dir / "captions")
 
     backend = config.captioning.backend.value
-    if backend == "omlx":
-        model_name = resolve_omlx_model(config.captioning).split("/")[-1]
+    if backend in ("vllm", "omlx"):
+        model_name = resolve_inference_model(config.captioning).split("/")[-1]
     else:
         model_name = config.captioning.ollama_model
 
@@ -198,14 +202,6 @@ def summarize_node(state: ScreenLensState) -> dict:
     print(f"[SUMMARIZE] Generating answer for: '{query}'")
     print(f"{'='*60}")
 
-    from langchain_ollama import ChatOllama
-
-    llm = ChatOllama(
-        model=config.search.summarization_model,
-        base_url=config.search.base_url,
-        temperature=0.3,
-    )
-
     context_parts = []
     for r in results[:config.search.top_k]:
         ts = r.get("timestamp_str", "unknown")
@@ -215,26 +211,34 @@ def summarize_node(state: ScreenLensState) -> dict:
 
     context = "\n\n---\n\n".join(context_parts)
 
-    messages = [
-        (
-            "system",
-            "You are a video analysis assistant. Synthesize a direct answer to the user's "
-            "question by drawing across MULTIPLE frame descriptions — do not echo or "
-            "reformat a single frame verbatim. Identify what is consistent across frames, "
-            "what changes over time, and which timestamps are most relevant. Reference "
-            "specific timestamps for any concrete claim. Be concise and focused on the "
-            "question asked: skip details that are not relevant. Output the answer "
-            "directly — no preamble, no planning notes, no 'let me know if you'd like' "
-            "sign-offs, no meta-commentary.",
-        ),
-        (
-            "human",
-            f"Question: {query}\n\nVideo frame descriptions:\n\n{context}",
-        ),
-    ]
+    system = (
+        "You are a video analysis assistant. Synthesize a direct answer to the user's "
+        "question by drawing across MULTIPLE frame descriptions — do not echo or "
+        "reformat a single frame verbatim. Identify what is consistent across frames, "
+        "what changes over time, and which timestamps are most relevant. Reference "
+        "specific timestamps for any concrete claim. Be concise and focused on the "
+        "question asked: skip details that are not relevant. Output the answer directly "
+        "with no preamble, planning notes, sign-off, or meta-commentary."
+    )
+    user = f"Question: {query}\n\nVideo frame descriptions:\n\n{context}"
 
-    response = llm.invoke(messages)
-    summary = response.content
+    if config.captioning.backend.value == "ollama":
+        from langchain_ollama import ChatOllama
+
+        llm = ChatOllama(
+            model=config.search.summarization_model,
+            base_url=config.search.base_url,
+            temperature=0.3,
+        )
+        summary = llm.invoke([("system", system), ("human", user)]).content
+    else:
+        summary = _inference_text_generate(
+            InferenceClient(config.captioning),
+            system,
+            user,
+            max_tokens=2048,
+            temperature=0.3,
+        )
 
     elapsed = time.time() - t0
     print(f"\nSummary generated in {elapsed:.1f}s")
@@ -247,19 +251,20 @@ def summarize_node(state: ScreenLensState) -> dict:
     }
 
 
-def _omlx_text_generate(
-    client: OMLXClient,
+def _inference_text_generate(
+    client: InferenceClient,
     system_prompt: str,
     user_prompt: str,
     max_tokens: int = 2048,
     temperature: float = 0.3,
 ) -> str:
-    """Generate text through the configured oMLX server."""
+    """Generate text through the configured OpenAI-compatible server."""
     return client.chat(
         system_prompt,
         user_prompt,
         max_tokens=max_tokens,
         temperature=temperature,
+        extra={"chat_template_kwargs": {"enable_thinking": False}},
     )
 
 
@@ -344,10 +349,10 @@ def summarize_all_node(state: ScreenLensState) -> dict:
     print(f"[SUMMARIZE] Full-video summary from {len(captioned)} frames")
     print(f"{'='*60}")
 
-    # Summarization uses oMLX. Ollama remains a captioning fallback.
-    model = OMLXClient(config.captioning)
-    model_context = config.captioning.omlx_model_context
-    print(f"Using oMLX model: {model.model} at {model.base_url}")
+    # Full summarization uses the selected direct provider.
+    model = InferenceClient(config.captioning)
+    model_context = resolve_inference_context(config.captioning)
+    print(f"Using {model.backend.value} model: {model.model} at {model.base_url}")
 
     # ── Compute chunking strategy ────────────────────────────────────────
     strategy = _compute_chunk_strategy(captioned, model_context)
@@ -392,7 +397,7 @@ def summarize_all_node(state: ScreenLensState) -> dict:
             f"Frame descriptions:\n\n{captions_block}"
         )
 
-        summary = _omlx_text_generate(model, system, user, max_tokens=4096)
+        summary = _inference_text_generate(model, system, user, max_tokens=4096)
 
         elapsed = time.time() - t0
         print(f"\nFull-video summary generated in {elapsed:.1f}s")
@@ -435,7 +440,7 @@ def summarize_all_node(state: ScreenLensState) -> dict:
         )
         user = f"Segment {i+1} ({time_range}):\n\n{chunk_text}"
 
-        response = _omlx_text_generate(model, system, user)
+        response = _inference_text_generate(model, system, user)
         chunk_summaries.append(f"**Segment {i+1} ({time_range}):** {response}")
         print(f"  Chunk {i+1}/{len(chunks)} summarized.")
 
@@ -462,7 +467,7 @@ def summarize_all_node(state: ScreenLensState) -> dict:
         f"Segment summaries:\n\n{all_chunk_summaries}"
     )
 
-    summary = _omlx_text_generate(model, system, user, max_tokens=4096)
+    summary = _inference_text_generate(model, system, user, max_tokens=4096)
 
     elapsed = time.time() - t0
     print(f"\nFull-video summary generated in {elapsed:.1f}s")

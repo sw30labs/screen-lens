@@ -2,7 +2,7 @@
 CLI Interface for ScreenLens.
 
 Usage:
-    python -m src.cli ingest VIDEO_PATH                     # Ingest with oMLX + keyframes
+    python -m src.cli ingest VIDEO_PATH                     # Native backend + keyframes
     python -m src.cli ingest VIDEO_PATH --backend ollama    # Use Ollama instead
     python -m src.cli search "your query"                   # Search ingested video
     python -m src.cli run VIDEO_PATH "query"                # Ingest + search in one shot
@@ -21,18 +21,32 @@ from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 
-from .config import ScreenLensConfig, CaptionBackend, ExtractionStrategy
-from .omlx_client import resolve_omlx_model
+from .config import (
+    ScreenLensConfig,
+    CaptionBackend,
+    ExtractionStrategy,
+    InferenceBackend,
+    default_caption_backend,
+    default_embedding_device,
+    default_inference_backend,
+    default_inference_concurrency,
+)
+from .omlx_client import resolve_inference_model
 from .pipeline import build_ingest_graph, build_search_graph, build_full_graph, summarize_all_node
 
 app = typer.Typer(
     name="screenlens",
-    help="ScreenLens — Local video scene intelligence for Apple Silicon",
+    help="ScreenLens — Local video scene intelligence for DGX Spark and Apple Silicon",
     rich_markup_mode="rich",
 )
 console = Console()
 
-DEFAULT_OMLX_URL = "http://127.0.0.1:8000/v1"
+DEFAULT_INFERENCE_URL = "http://127.0.0.1:8000/v1"
+DEFAULT_OMLX_URL = DEFAULT_INFERENCE_URL  # compatibility for external imports
+DEFAULT_BACKEND = default_caption_backend().value
+DEFAULT_INFERENCE_BACKEND = default_inference_backend().value
+DEFAULT_DEVICE = default_embedding_device()
+DEFAULT_BATCH_SIZE = default_inference_concurrency()
 
 
 def _load_config(config_path: Optional[str] = None) -> ScreenLensConfig:
@@ -61,10 +75,10 @@ def _apply_video_slug(config: ScreenLensConfig, video: Path) -> str:
 def _apply_captioning_options(
     config: ScreenLensConfig,
     *,
-    backend: str = "omlx",
+    backend: str = DEFAULT_BACKEND,
     ollama_model: str = "llama3.2-vision",
     ollama_url: str = "http://127.0.0.1:11434",
-    batch_size: int = 4,
+    batch_size: int = DEFAULT_BATCH_SIZE,
     omlx_url: str = DEFAULT_OMLX_URL,
     omlx_model: Optional[str] = None,
     omlx_api_key: Optional[str] = None,
@@ -74,17 +88,25 @@ def _apply_captioning_options(
     config.captioning.ollama_model = ollama_model
     config.captioning.ollama_base_url = ollama_url
     config.captioning.batch_size = batch_size
-    config.captioning.omlx_base_url = omlx_url
-    if omlx_model is not None:
-        config.captioning.omlx_model = omlx_model
-    if omlx_api_key is not None:
-        config.captioning.omlx_api_key = omlx_api_key
+    if config.captioning.backend == CaptionBackend.vllm:
+        config.captioning.vllm_base_url = omlx_url
+        if omlx_model is not None:
+            config.captioning.vllm_model = omlx_model
+        if omlx_api_key is not None:
+            config.captioning.vllm_api_key = omlx_api_key
+    else:
+        config.captioning.omlx_base_url = omlx_url
+        if omlx_model is not None:
+            config.captioning.omlx_model = omlx_model
+        if omlx_api_key is not None:
+            config.captioning.omlx_api_key = omlx_api_key
 
 
 def _caption_model_display(config: ScreenLensConfig) -> str:
     """Return a short model label for CLI panels."""
-    if config.captioning.backend == CaptionBackend.omlx:
-        return f"{resolve_omlx_model(config.captioning).split('/')[-1]} via oMLX"
+    if config.captioning.backend in (CaptionBackend.vllm, CaptionBackend.omlx):
+        provider = "vLLM" if config.captioning.backend == CaptionBackend.vllm else "oMLX"
+        return f"{resolve_inference_model(config.captioning).split('/')[-1]} via {provider}"
     return f"{config.captioning.ollama_model} via Ollama"
 
 
@@ -96,15 +118,24 @@ def ingest(
     fps: float = typer.Option(1.0, help="Frames per second (only for fixed_fps strategy)"),
     max_interval: float = typer.Option(4.0, help="Max seconds between keyframes (keyframe strategy)"),
     # Captioning backend
-    backend: str = typer.Option("omlx", help="Caption backend: 'omlx' or 'ollama'"),
-    omlx_url: str = typer.Option(DEFAULT_OMLX_URL, help="oMLX API URL or dashboard URL"),
-    omlx_model: Optional[str] = typer.Option(None, help="oMLX model ID (defaults to env or 'default')"),
-    omlx_api_key: Optional[str] = typer.Option(None, help="oMLX API key (defaults to MLX_API_KEY/OMLX_API_KEY)"),
+    backend: str = typer.Option(DEFAULT_BACKEND, help="Caption backend: vllm, omlx, or ollama"),
+    omlx_url: str = typer.Option(
+        DEFAULT_INFERENCE_URL, "--inference-url", "--vllm-url", "--omlx-url",
+        help="OpenAI-compatible inference API URL",
+    ),
+    omlx_model: Optional[str] = typer.Option(
+        None, "--inference-model", "--vllm-model", "--omlx-model",
+        help="Served model id (defaults to provider environment)",
+    ),
+    omlx_api_key: Optional[str] = typer.Option(
+        None, "--inference-api-key", "--vllm-api-key", "--omlx-api-key",
+        help="Optional inference API key",
+    ),
     ollama_model: str = typer.Option("llama3.2-vision", help="Ollama vision model (if backend=ollama)"),
     ollama_url: str = typer.Option("http://127.0.0.1:11434", help="Ollama API URL"),
-    batch_size: int = typer.Option(4, help="Frames per captioning chunk/concurrent oMLX requests"),
+    batch_size: int = typer.Option(DEFAULT_BATCH_SIZE, help="Concurrent caption requests"),
     # Other
-    device: str = typer.Option("mps", help="Device for CLIP: mps, cuda, cpu"),
+    device: str = typer.Option(DEFAULT_DEVICE, help="Device for CLIP: mps, cuda, cpu"),
     config_file: Optional[str] = typer.Option(None, help="Path to config JSON file"),
 ):
     """Ingest a video: extract keyframes, generate captions, create embeddings."""
@@ -275,8 +306,11 @@ def search(
     summarize: bool = typer.Option(True, help="Generate LLM summary of results"),
     collection: Optional[str] = typer.Option(None, help="ChromaDB collection name (e.g. screenlens_existinginvestment)"),
     data_dir: Optional[str] = typer.Option(None, help="Data directory — a single video folder or the parent ./data/ for all"),
-    ollama_url: str = typer.Option("http://127.0.0.1:11434", help="Ollama API URL"),
-    device: str = typer.Option("mps", help="Device for CLIP: mps, cuda, cpu"),
+    ollama_url: str = typer.Option(
+        "http://127.0.0.1:11434",
+        help="Ollama API URL (used only when the loaded config selects Ollama)",
+    ),
+    device: str = typer.Option(DEFAULT_DEVICE, help="Device for CLIP: mps, cuda, cpu"),
     config_file: Optional[str] = typer.Option(None, help="Path to config JSON file"),
 ):
     """Search the ingested video with a natural language query."""
@@ -376,11 +410,20 @@ def run(
     video_path: str = typer.Argument(..., help="Path to the video file"),
     query: str = typer.Argument(..., help="Natural language search query"),
     strategy: str = typer.Option("keyframe", help="Extraction strategy: 'keyframe' or 'fixed_fps'"),
-    backend: str = typer.Option("omlx", help="Caption backend: 'omlx' or 'ollama'"),
-    omlx_url: str = typer.Option(DEFAULT_OMLX_URL, help="oMLX API URL or dashboard URL"),
-    omlx_model: Optional[str] = typer.Option(None, help="oMLX model ID (defaults to env or 'default')"),
-    omlx_api_key: Optional[str] = typer.Option(None, help="oMLX API key (defaults to MLX_API_KEY/OMLX_API_KEY)"),
-    device: str = typer.Option("mps", help="Device for CLIP"),
+    backend: str = typer.Option(DEFAULT_BACKEND, help="Caption backend: vllm, omlx, or ollama"),
+    omlx_url: str = typer.Option(
+        DEFAULT_INFERENCE_URL, "--inference-url", "--vllm-url", "--omlx-url",
+        help="OpenAI-compatible inference API URL",
+    ),
+    omlx_model: Optional[str] = typer.Option(
+        None, "--inference-model", "--vllm-model", "--omlx-model",
+        help="Served model id",
+    ),
+    omlx_api_key: Optional[str] = typer.Option(
+        None, "--inference-api-key", "--vllm-api-key", "--omlx-api-key",
+        help="Optional inference API key",
+    ),
+    device: str = typer.Option(DEFAULT_DEVICE, help="Device for CLIP"),
 ):
     """Ingest a video AND search it in one shot."""
     video = Path(video_path)
@@ -417,16 +460,26 @@ def run(
 
 @app.command()
 def summarize(
-    omlx_url: str = typer.Option(DEFAULT_OMLX_URL, help="oMLX API URL or dashboard URL"),
-    omlx_model: Optional[str] = typer.Option(None, help="oMLX model ID (defaults to env or 'default')"),
-    omlx_api_key: Optional[str] = typer.Option(None, help="oMLX API key (defaults to MLX_API_KEY/OMLX_API_KEY)"),
+    backend: str = typer.Option(DEFAULT_INFERENCE_BACKEND, help="Inference backend: vllm or omlx"),
+    omlx_url: str = typer.Option(
+        DEFAULT_INFERENCE_URL, "--inference-url", "--vllm-url", "--omlx-url",
+        help="OpenAI-compatible inference API URL",
+    ),
+    omlx_model: Optional[str] = typer.Option(
+        None, "--inference-model", "--vllm-model", "--omlx-model",
+        help="Served model id",
+    ),
+    omlx_api_key: Optional[str] = typer.Option(
+        None, "--inference-api-key", "--vllm-api-key", "--omlx-api-key",
+        help="Optional inference API key",
+    ),
     config_file: Optional[str] = typer.Option(None, help="Path to config JSON file"),
 ):
     """Generate a full-video summary from all ingested captions."""
     config = _load_config(config_file)
     _apply_captioning_options(
         config,
-        backend="omlx",
+        backend=backend,
         omlx_url=omlx_url,
         omlx_model=omlx_model,
         omlx_api_key=omlx_api_key,
@@ -466,15 +519,24 @@ def batch(
     fps: float = typer.Option(1.0, help="Frames per second (only for fixed_fps strategy)"),
     max_interval: float = typer.Option(4.0, help="Max seconds between keyframes (keyframe strategy)"),
     # Captioning backend
-    backend: str = typer.Option("omlx", help="Caption backend: 'omlx' or 'ollama'"),
-    omlx_url: str = typer.Option(DEFAULT_OMLX_URL, help="oMLX API URL or dashboard URL"),
-    omlx_model: Optional[str] = typer.Option(None, help="oMLX model ID (defaults to env or 'default')"),
-    omlx_api_key: Optional[str] = typer.Option(None, help="oMLX API key (defaults to MLX_API_KEY/OMLX_API_KEY)"),
+    backend: str = typer.Option(DEFAULT_BACKEND, help="Caption backend: vllm, omlx, or ollama"),
+    omlx_url: str = typer.Option(
+        DEFAULT_INFERENCE_URL, "--inference-url", "--vllm-url", "--omlx-url",
+        help="OpenAI-compatible inference API URL",
+    ),
+    omlx_model: Optional[str] = typer.Option(
+        None, "--inference-model", "--vllm-model", "--omlx-model",
+        help="Served model id",
+    ),
+    omlx_api_key: Optional[str] = typer.Option(
+        None, "--inference-api-key", "--vllm-api-key", "--omlx-api-key",
+        help="Optional inference API key",
+    ),
     ollama_model: str = typer.Option("llama3.2-vision", help="Ollama vision model (if backend=ollama)"),
     ollama_url: str = typer.Option("http://127.0.0.1:11434", help="Ollama API URL"),
-    batch_size: int = typer.Option(4, help="Frames per captioning chunk/concurrent oMLX requests"),
+    batch_size: int = typer.Option(DEFAULT_BATCH_SIZE, help="Concurrent caption requests"),
     # Other
-    device: str = typer.Option("mps", help="Device for CLIP: mps, cuda, cpu"),
+    device: str = typer.Option(DEFAULT_DEVICE, help="Device for CLIP: mps, cuda, cpu"),
     config_file: Optional[str] = typer.Option(None, help="Path to config JSON file"),
 ):
     """Batch-ingest all videos in a folder."""
@@ -548,9 +610,19 @@ def batch(
 def reconstruct(
     folder: Optional[str] = typer.Argument(None, help="Specific video folder to reconstruct (e.g. existinginvestment_20260408_223036)"),
     data_dir: str = typer.Option("./data", help="Base data directory containing ingested video folders"),
-    omlx_url: str = typer.Option(DEFAULT_OMLX_URL, help="oMLX API URL or dashboard URL"),
-    omlx_model: Optional[str] = typer.Option(None, help="oMLX model ID (defaults to env or 'default')"),
-    omlx_api_key: Optional[str] = typer.Option(None, help="oMLX API key (defaults to MLX_API_KEY/OMLX_API_KEY)"),
+    backend: str = typer.Option(DEFAULT_INFERENCE_BACKEND, help="Inference backend: vllm or omlx"),
+    omlx_url: str = typer.Option(
+        DEFAULT_INFERENCE_URL, "--inference-url", "--vllm-url", "--omlx-url",
+        help="OpenAI-compatible inference API URL",
+    ),
+    omlx_model: Optional[str] = typer.Option(
+        None, "--inference-model", "--vllm-model", "--omlx-model",
+        help="Served model id",
+    ),
+    omlx_api_key: Optional[str] = typer.Option(
+        None, "--inference-api-key", "--vllm-api-key", "--omlx-api-key",
+        help="Optional inference API key",
+    ),
     config_file: Optional[str] = typer.Option(None, help="Path to config JSON file"),
 ):
     """Reconstruct artifacts from ingested video captions.
@@ -601,7 +673,7 @@ def reconstruct(
     config = _load_config(config_file)
     _apply_captioning_options(
         config,
-        backend="omlx",
+        backend=backend,
         omlx_url=omlx_url,
         omlx_model=omlx_model,
         omlx_api_key=omlx_api_key,
@@ -679,9 +751,19 @@ def reconstruct(
 def assemble(
     data_dir: str = typer.Option("./data", help="Directory containing data/*/output/ artifacts"),
     output_dir: str = typer.Option("./OUTPUT", help="Where to write the assembled tree"),
-    omlx_url: str = typer.Option(DEFAULT_OMLX_URL, help="oMLX API URL or dashboard URL"),
-    omlx_model: Optional[str] = typer.Option(None, help="oMLX model ID (defaults to env or 'default')"),
-    omlx_api_key: Optional[str] = typer.Option(None, help="oMLX API key (defaults to MLX_API_KEY/OMLX_API_KEY)"),
+    backend: str = typer.Option(DEFAULT_INFERENCE_BACKEND, help="Inference backend: vllm or omlx"),
+    omlx_url: str = typer.Option(
+        DEFAULT_INFERENCE_URL, "--inference-url", "--vllm-url", "--omlx-url",
+        help="OpenAI-compatible inference API URL",
+    ),
+    omlx_model: Optional[str] = typer.Option(
+        None, "--inference-model", "--vllm-model", "--omlx-model",
+        help="Served model id",
+    ),
+    omlx_api_key: Optional[str] = typer.Option(
+        None, "--inference-api-key", "--vllm-api-key", "--omlx-api-key",
+        help="Optional inference API key",
+    ),
     mapping: Optional[str] = typer.Option(None, help="Path to a hand-edited MANIFEST.json — skips LLM inference"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Stop after corpus classification, write nothing"),
     config_file: Optional[str] = typer.Option(None, help="Path to config JSON file"),
@@ -702,7 +784,7 @@ def assemble(
     config = _load_config(config_file)
     _apply_captioning_options(
         config,
-        backend="omlx",
+        backend=backend,
         omlx_url=omlx_url,
         omlx_model=omlx_model,
         omlx_api_key=omlx_api_key,
@@ -737,13 +819,20 @@ def assemble(
 @app.command()
 def transcribe(
     video_path: str = typer.Argument(..., help="Path to the screen recording (.mov, .mp4, ...)"),
-    ocr_model: Optional[str] = typer.Option(None, help="Vision OCR model id (default: env OCR_MODEL or recommended olmOCR-2)"),
-    llm_model: Optional[str] = typer.Option(None, help="Text LLM for seam/indent cleanup (default: env LLM_MODEL)"),
-    omlx_url: str = typer.Option(DEFAULT_OMLX_URL, help="oMLX API URL or dashboard URL"),
-    omlx_api_key: Optional[str] = typer.Option(None, help="oMLX API key (default: MLX_API_KEY/OMLX_API_KEY)"),
+    backend: str = typer.Option(DEFAULT_INFERENCE_BACKEND, help="Inference backend: vllm or omlx"),
+    ocr_model: Optional[str] = typer.Option(None, help="Vision OCR model id (defaults to the served model)"),
+    llm_model: Optional[str] = typer.Option(None, help="Text model for optional seam cleanup"),
+    omlx_url: str = typer.Option(
+        DEFAULT_INFERENCE_URL, "--inference-url", "--vllm-url", "--omlx-url",
+        help="OpenAI-compatible inference API URL",
+    ),
+    omlx_api_key: Optional[str] = typer.Option(
+        None, "--inference-api-key", "--vllm-api-key", "--omlx-api-key",
+        help="Optional inference API key",
+    ),
     sample_fps: float = typer.Option(2.0, help="Frames/sec to sample before dedup"),
     cleanup: bool = typer.Option(False, "--cleanup", help="Run the optional LLM seam/indent cleanup pass (default: off — the raw stitched transcript is already verbatim)"),
-    deterministic: bool = typer.Option(False, "--deterministic", help="Also run Apple Vision backstop (best for code)"),
+    deterministic: bool = typer.Option(False, "--deterministic", help="Also run Apple Vision backstop (macOS only)"),
     config_file: Optional[str] = typer.Option(None, help="Path to config JSON file"),
 ):
     """Verbatim transcription: faithfully reconstruct the text/code shown in a recording.
@@ -752,7 +841,7 @@ def transcribe(
     LLM seam/indent cleanup. Output is written to ./data/<slug>/output/transcript.md.
     """
     from .transcribe import transcribe_video
-    from .omlx_client import normalize_omlx_base_url
+    from .omlx_client import normalize_api_base_url
 
     video = Path(video_path)
     if not video.exists():
@@ -760,7 +849,10 @@ def transcribe(
         raise typer.Exit(1)
 
     config = _load_config(config_file)
-    base = normalize_omlx_base_url(omlx_url)
+    direct_backend = InferenceBackend(backend)
+    base = normalize_api_base_url(omlx_url)
+    config.ocr.backend = direct_backend
+    config.reconstruction.backend = direct_backend
     config.ocr.base_url = base
     config.reconstruction.base_url = base
     if ocr_model is not None:
@@ -812,27 +904,45 @@ def transcribe(
 
 @app.command()
 def models(
-    omlx_url: str = typer.Option(DEFAULT_OMLX_URL, help="oMLX API URL or dashboard URL"),
-    omlx_api_key: Optional[str] = typer.Option(None, help="oMLX API key (default: MLX_API_KEY/OMLX_API_KEY)"),
+    backend: str = typer.Option(DEFAULT_INFERENCE_BACKEND, help="Inference backend: vllm or omlx"),
+    omlx_url: str = typer.Option(
+        DEFAULT_INFERENCE_URL, "--inference-url", "--vllm-url", "--omlx-url",
+        help="OpenAI-compatible inference API URL",
+    ),
+    omlx_api_key: Optional[str] = typer.Option(
+        None, "--inference-api-key", "--vllm-api-key", "--omlx-api-key",
+        help="Optional inference API key",
+    ),
 ):
-    """List models served by oMLX and flag which can do OCR (vision)."""
-    from .omlx_client import list_models, is_known_text_only_model, _env_value, _KNOWN_VISION_MARKERS
+    """List served models and flag which can do OCR (vision)."""
+    from .omlx_client import (
+        list_models,
+        is_known_text_only_model,
+        is_known_vision_model,
+        _env_value,
+    )
 
-    key = omlx_api_key or _env_value("MLX_API_KEY", "OMLX_API_KEY", ignore_placeholders=True)
+    if backend == InferenceBackend.vllm.value:
+        key = omlx_api_key or _env_value(
+            "VLLM_API_KEY", ignore_placeholders=True
+        ) or "local"
+    else:
+        key = omlx_api_key or _env_value(
+            "MLX_API_KEY", "OMLX_API_KEY", ignore_placeholders=True
+        )
     try:
         ids = list_models(omlx_url, key)
     except Exception as exc:
-        console.print(f"[red]Could not reach oMLX: {exc}[/red]")
+        console.print(f"[red]Could not reach {backend}: {exc}[/red]")
         raise typer.Exit(1)
 
-    table = Table(title=f"oMLX models ({len(ids)})")
+    table = Table(title=f"{backend} models ({len(ids)})")
     table.add_column("Model id", style="cyan")
     table.add_column("OCR-capable?", justify="center")
     for mid in sorted(ids):
-        low = mid.lower()
         if is_known_text_only_model(mid):
             cap = "[red]no (text-only)[/red]"
-        elif any(m in low for m in _KNOWN_VISION_MARKERS) or "ocr" in low:
+        elif is_known_vision_model(mid):
             cap = "[green]yes (vision)[/green]"
         else:
             cap = "[yellow]unknown[/yellow]"

@@ -28,16 +28,78 @@ def load_test_cases():
 class TestConfig:
     """Test the configuration system."""
 
-    def test_default_config(self):
+    def test_dgx_spark_defaults(self, monkeypatch):
+        import src.config as config_module
+        from src.config import CaptionBackend, InferenceBackend, ScreenLensConfig
+
+        monkeypatch.delenv("SCREENLENS_BACKEND", raising=False)
+        monkeypatch.delenv("SCREENLENS_DEVICE", raising=False)
+        monkeypatch.delenv("SCREENLENS_BATCH_SIZE", raising=False)
+        monkeypatch.setattr(config_module, "_DOTENV_LOADED", True)
+        monkeypatch.setattr(config_module.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(config_module.platform, "machine", lambda: "aarch64")
+
+        config = ScreenLensConfig()
+        assert config.captioning.backend == CaptionBackend.vllm
+        assert config.captioning.vllm_base_url == "http://127.0.0.1:8000/v1"
+        assert config.captioning.disable_thinking is True
+        assert config.captioning.max_tokens == 4096
+        assert config.captioning.batch_size == 2
+        assert config.ocr.backend == InferenceBackend.vllm
+        assert config.frame_extraction.fps == 1.0
+        assert config.embedding.device == "cuda"
+        assert config.vector_db.collection_name == "screenlens_frames"
+
+    def test_apple_silicon_defaults(self, monkeypatch):
+        import src.config as config_module
         from src.config import CaptionBackend, ScreenLensConfig
+
+        monkeypatch.delenv("SCREENLENS_BACKEND", raising=False)
+        monkeypatch.delenv("SCREENLENS_DEVICE", raising=False)
+        monkeypatch.delenv("SCREENLENS_BATCH_SIZE", raising=False)
+        monkeypatch.setattr(config_module, "_DOTENV_LOADED", True)
+        monkeypatch.setattr(config_module.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(config_module.platform, "machine", lambda: "arm64")
+
         config = ScreenLensConfig()
         assert config.captioning.backend == CaptionBackend.omlx
-        assert config.captioning.omlx_base_url == "http://127.0.0.1:8000/v1"
-        assert config.captioning.disable_thinking is True
-        assert config.captioning.max_tokens == 32768
-        assert config.frame_extraction.fps == 1.0
+        assert config.captioning.batch_size == 4
         assert config.embedding.device == "mps"
-        assert config.vector_db.collection_name == "screenlens_frames"
+
+    def test_platform_defaults_accept_environment_overrides(self, monkeypatch):
+        from src.config import CaptionBackend, InferenceBackend, ScreenLensConfig
+
+        monkeypatch.setenv("SCREENLENS_BACKEND", "ollama")
+        monkeypatch.setenv("SCREENLENS_DEVICE", "cpu")
+        monkeypatch.setenv("SCREENLENS_BATCH_SIZE", "7")
+
+        config = ScreenLensConfig()
+        assert config.captioning.backend == CaptionBackend.ollama
+        assert config.ocr.backend in (InferenceBackend.vllm, InferenceBackend.omlx)
+        assert config.captioning.batch_size == 7
+        assert config.embedding.device == "cpu"
+
+    def test_dotenv_applies_platform_default_overrides(self, monkeypatch, tmp_path):
+        import src.config as config_module
+        from src.config import CaptionBackend, ScreenLensConfig
+
+        (tmp_path / ".env").write_text(
+            "SCREENLENS_BACKEND=ollama\n"
+            "SCREENLENS_DEVICE=cpu\n"
+            "SCREENLENS_BATCH_SIZE=3\n",
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("SCREENLENS_BACKEND", raising=False)
+        monkeypatch.delenv("SCREENLENS_DEVICE", raising=False)
+        monkeypatch.delenv("SCREENLENS_BATCH_SIZE", raising=False)
+        monkeypatch.setattr(config_module, "_DOTENV_LOADED", False)
+
+        config = ScreenLensConfig()
+
+        assert config.captioning.backend == CaptionBackend.ollama
+        assert config.captioning.batch_size == 3
+        assert config.embedding.device == "cpu"
 
     def test_config_override(self):
         from src.config import ScreenLensConfig
@@ -91,6 +153,7 @@ class TestOMLXClient:
         assert normalize_omlx_base_url("http://127.0.0.1:8000/v1") == "http://127.0.0.1:8000/v1"
 
     def test_dotenv_loads_omlx_values_without_overriding_shell(self, monkeypatch, tmp_path):
+        import src.config as config_module
         from src.config import CaptioningConfig
         import src.omlx_client as omlx_client
 
@@ -106,18 +169,21 @@ class TestOMLXClient:
         monkeypatch.delenv("MLX_API_KEY", raising=False)
         monkeypatch.delenv("OMLX_API_KEY", raising=False)
         monkeypatch.delenv("MLX_MODEL", raising=False)
-        monkeypatch.setattr(omlx_client, "_DOTENV_LOADED", False)
+        monkeypatch.setattr(config_module, "_DOTENV_LOADED", False)
 
         assert omlx_client.resolve_omlx_api_key(CaptioningConfig()) == "dotenv-key"
         assert omlx_client.resolve_omlx_model(CaptioningConfig()) == "dotenv-model"
 
     def test_rejects_known_text_only_models_for_image_chat(self):
-        from src.config import CaptioningConfig
+        from src.config import CaptionBackend, CaptioningConfig
         from src.omlx_client import OMLXClient
 
-        client = OMLXClient(CaptioningConfig(omlx_model="deepseek-ai-DeepSeek-V4-Flash-8bit"))
+        client = OMLXClient(CaptioningConfig(
+            backend=CaptionBackend.omlx,
+            omlx_model="deepseek-ai-DeepSeek-V4-Flash-8bit",
+        ))
 
-        with pytest.raises(ValueError, match="text-only oMLX model"):
+        with pytest.raises(ValueError, match="text-only model"):
             client.chat("system", "describe", images=["missing.jpg"])
 
     def test_tui_hides_known_text_only_omlx_models(self):
@@ -132,7 +198,100 @@ class TestOMLXClient:
             "deepseek-ai-DeepSeek-V4-Flash-8bit",
         )
 
-        assert options == [("MiniMax-M2.7", "MiniMax-M2.7")]
+        assert options == []
+
+    def test_tui_summary_supports_ollama_backend(self):
+        from src.config import CaptionBackend, ScreenLensConfig
+        from src.tui import _summary_rows
+
+        config = ScreenLensConfig()
+        config.captioning.backend = CaptionBackend.ollama
+        rows = dict(_summary_rows(config, None))
+
+        assert rows["Inference URL"] == config.captioning.ollama_base_url
+        assert rows["Inference key"] == "n/a"
+
+    def test_vllm_defaults_and_legacy_env_isolation(self, monkeypatch):
+        from src.config import CaptionBackend, CaptioningConfig, OCRConfig, ReconstructionConfig
+        from src.omlx_client import (
+            DEFAULT_VLLM_MODEL,
+            resolve_inference_api_key,
+            resolve_inference_base_url,
+            resolve_inference_context,
+            resolve_inference_model,
+            resolve_llm_model,
+            resolve_ocr_model,
+            resolve_role_api_key,
+            resolve_role_context,
+        )
+
+        monkeypatch.setenv("MLX_MODEL", "legacy-mlx-model")
+        monkeypatch.setenv("OCR_MODEL", "legacy-ocr-model")
+        monkeypatch.setenv("LLM_MODEL", "legacy-text-model")
+        monkeypatch.setenv("VLLM_BASE_URL", "http://spark.local:9000/v1/")
+        monkeypatch.setenv("VLLM_API_KEY", "spark-secret")
+        monkeypatch.delenv("VLLM_MODEL", raising=False)
+
+        captioning = CaptioningConfig(backend=CaptionBackend.vllm)
+        assert resolve_inference_base_url(captioning) == "http://spark.local:9000/v1"
+        assert resolve_inference_api_key(captioning) == "spark-secret"
+        assert resolve_inference_model(captioning) == DEFAULT_VLLM_MODEL
+        assert resolve_ocr_model(OCRConfig(backend="vllm")) == DEFAULT_VLLM_MODEL
+        assert resolve_llm_model(ReconstructionConfig(backend="vllm")) == DEFAULT_VLLM_MODEL
+
+        monkeypatch.setenv("VLLM_MAX_MODEL_LEN", "16384")
+        assert resolve_inference_context(captioning) == 16384
+        assert resolve_role_context(ReconstructionConfig(backend="vllm")) == 16384
+        assert resolve_inference_context(
+            CaptioningConfig(backend=CaptionBackend.vllm, vllm_model_context=24576)
+        ) == 24576
+
+        monkeypatch.setenv("VLLM_OCR_API_KEY", "spark-ocr-secret")
+        monkeypatch.setenv("OCR_API_KEY", "legacy-ocr-secret")
+        assert resolve_role_api_key(
+            OCRConfig(backend="vllm"), "VLLM_OCR_API_KEY", "OCR_API_KEY"
+        ) == "spark-ocr-secret"
+        assert resolve_role_api_key(
+            OCRConfig(backend="omlx"), "VLLM_OCR_API_KEY", "OCR_API_KEY"
+        ) == "legacy-ocr-secret"
+
+    def test_nvidia_qwen_spark_model_is_known_multimodal(self):
+        from src.omlx_client import DEFAULT_VLLM_MODEL, is_known_vision_model
+
+        assert is_known_vision_model(DEFAULT_VLLM_MODEL)
+
+    def test_loopback_requests_bypass_proxy_environment(self, monkeypatch):
+        from urllib import request
+        import src.omlx_client as inference_client
+
+        captured = {}
+        sentinel = object()
+
+        class FakeOpener:
+            def open(self, req, timeout):
+                captured["url"] = req.full_url
+                captured["timeout"] = timeout
+                return sentinel
+
+        def fake_build_opener(*handlers):
+            captured["handlers"] = handlers
+            return FakeOpener()
+
+        monkeypatch.setattr(inference_client.request, "build_opener", fake_build_opener)
+        monkeypatch.setattr(
+            inference_client.request,
+            "urlopen",
+            lambda *args, **kwargs: pytest.fail("loopback request inherited proxy handling"),
+        )
+
+        result = inference_client._urlopen(
+            request.Request("http://127.0.0.1:8000/v1/models"),
+            timeout=3,
+        )
+
+        assert result is sentinel
+        assert captured["timeout"] == 3
+        assert captured["handlers"][0].proxies == {}
 
     def test_chat_posts_openai_vision_payload(self, monkeypatch, tmp_path):
         from PIL import Image
@@ -164,9 +323,11 @@ class TestOMLXClient:
             captured["timeout"] = timeout
             return FakeResponse()
 
-        monkeypatch.setattr(omlx_client.request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(omlx_client, "_urlopen", fake_urlopen)
 
+        from src.config import CaptionBackend
         cfg = CaptioningConfig(
+            backend=CaptionBackend.omlx,
             omlx_base_url="http://127.0.0.1:8000/admin/dashboard",
             omlx_model="vision-model",
             omlx_api_key="local-key",
@@ -196,12 +357,13 @@ class TestCaptioner:
     ):
         from PIL import Image
         from src.captioner import OMLXCaptioner
-        from src.config import CaptioningConfig
+        from src.config import CaptionBackend, CaptioningConfig
 
         img_path = tmp_path / "frame.jpg"
         Image.new("RGB", (4, 4), color="blue").save(img_path)
 
         config = CaptioningConfig(
+            backend=CaptionBackend.omlx,
             omlx_model="vision-model",
             disable_thinking=disable_thinking,
         )
@@ -225,7 +387,42 @@ class TestEmbedder:
     """Test CLIP embedding generation."""
 
     @pytest.fixture
-    def embedder(self):
+    def embedder(self, monkeypatch):
+        """Use a deterministic local OpenCLIP stand-in; live CUDA is helper-smoked."""
+        import sys
+        from types import SimpleNamespace
+        import numpy as np
+        import torch
+
+        class FakeModel:
+            visual = SimpleNamespace(output_dim=512)
+
+            def eval(self):
+                return self
+
+            def encode_image(self, images):
+                rgb = images.mean(dim=(-2, -1))
+                repeats = (512 + rgb.shape[1] - 1) // rgb.shape[1]
+                return rgb.repeat(1, repeats)[:, :512]
+
+            def encode_text(self, tokens):
+                rows = torch.arange(1, tokens.shape[0] + 1, dtype=torch.float32)
+                return rows[:, None].repeat(1, 512)
+
+        def preprocess(image):
+            array = np.asarray(image, dtype=np.float32) / 255.0
+            return torch.from_numpy(array).permute(2, 0, 1)
+
+        fake_open_clip = SimpleNamespace(
+            create_model_and_transforms=lambda *args, **kwargs: (
+                FakeModel(), None, preprocess
+            ),
+            get_tokenizer=lambda model_name: (
+                lambda queries: torch.ones((len(queries), 4), dtype=torch.long)
+            ),
+        )
+        monkeypatch.setitem(sys.modules, "open_clip", fake_open_clip)
+
         from src.config import EmbeddingConfig
         from src.embedder import CLIPEmbedder
         config = EmbeddingConfig(device="cpu")
@@ -340,3 +537,82 @@ class TestPipeline:
         from src.pipeline import build_full_graph
         graph = build_full_graph()
         assert graph is not None
+
+    def test_search_summary_uses_selected_vllm_client(self, monkeypatch):
+        import src.pipeline as pipeline
+        from src.config import CaptionBackend, ScreenLensConfig
+
+        captured = {}
+
+        class FakeClient:
+            def __init__(self, config):
+                captured["backend"] = config.backend
+
+            def chat(self, system, user, **kwargs):
+                captured["system"] = system
+                captured["user"] = user
+                captured["kwargs"] = kwargs
+                return "DGX summary"
+
+        monkeypatch.setattr(pipeline, "InferenceClient", FakeClient)
+        config = ScreenLensConfig()
+        config.captioning.backend = CaptionBackend.vllm
+
+        result = pipeline.summarize_node({
+            "query": "What application is shown?",
+            "search_results": [{
+                "timestamp_str": "00:00:01.000",
+                "caption": "A terminal shows ScreenLens.",
+                "score": 0.9,
+            }],
+            "config": config.model_dump(),
+        })
+
+        assert result["summary"] == "DGX summary"
+        assert captured["backend"] == CaptionBackend.vllm
+        assert captured["kwargs"]["extra"] == {
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+
+    def test_reconstruction_synthesis_keeps_spark_context_headroom(self, monkeypatch):
+        import src.reconstruct as reconstruct
+
+        captured = {}
+
+        class LegacyClient:
+            _default_max_tokens = 32768
+
+        def fake_generate(client, system, user, *, max_tokens, temperature):
+            captured["max_tokens"] = max_tokens
+            return "artifact"
+
+        monkeypatch.setattr(reconstruct, "generate_text", fake_generate)
+
+        result = reconstruct._hierarchical_synthesize(
+            ["a short extraction note"],
+            "Rebuild the artifact.",
+            "Return only the artifact.",
+            LegacyClient(),
+            model_context=32768,
+        )
+
+        assert result == "artifact"
+        assert captured["max_tokens"] == 8192
+        assert captured["max_tokens"] < 32768
+
+    def test_ollama_caption_config_uses_direct_reconstruction_backend(self):
+        import src.reconstruct as reconstruct
+        from src.config import CaptionBackend, InferenceBackend, ScreenLensConfig
+
+        config = ScreenLensConfig()
+        config.captioning.backend = CaptionBackend.ollama
+        config.reconstruction.backend = InferenceBackend.vllm
+        config.reconstruction.model = "org/reconstruction-model"
+        config.reconstruction.api_key = "direct-key"
+
+        direct = reconstruct._reconstruction_captioning_config(config)
+
+        assert direct.backend == CaptionBackend.vllm
+        assert direct.vllm_model == "org/reconstruction-model"
+        assert direct.vllm_api_key == "direct-key"
+        assert direct.max_tokens == config.reconstruction.max_tokens

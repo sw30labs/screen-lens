@@ -81,7 +81,7 @@ class CLIPEmbedder:
                     images.append(self._preprocess(Image.new("RGB", (224, 224))))
 
             batch_tensor = torch.stack(images).to(device)
-            with torch.no_grad():
+            with torch.inference_mode():
                 features = self._model.encode_image(batch_tensor)
                 features = features / features.norm(dim=-1, keepdim=True)
                 all_embeddings.append(features.cpu().numpy())
@@ -100,7 +100,7 @@ class CLIPEmbedder:
         device = self.config.device
 
         tokens = self._tokenizer(queries).to(device)
-        with torch.no_grad():
+        with torch.inference_mode():
             features = self._model.encode_text(tokens)
             features = features / features.norm(dim=-1, keepdim=True)
 
