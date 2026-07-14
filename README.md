@@ -81,6 +81,26 @@ oMLX can reuse existing MLX-format model directories and exposes models through 
 
 ## Installation
 
+For an idempotent Conda setup and launcher, run:
+
+```bash
+./setup_and_run.sh
+```
+
+The script creates a `screenlens` environment with Python 3.11 and ffmpeg when
+needed, installs ScreenLens in editable mode with TUI support, creates `.env`
+from `.env.example` without overwriting an existing file, and launches the TUI.
+Pass a CLI command to run it instead:
+
+```bash
+./setup_and_run.sh info
+./setup_and_run.sh ingest "video.mov"
+```
+
+Set `SCREENLENS_CONDA_ENV` to use a different Conda environment name.
+
+For a manual installation:
+
 ```bash
 cd screenlens
 pip install -e .
@@ -206,7 +226,8 @@ All settings live in `src/config.py` (Pydantic models). Key parameters:
 | `captioning.omlx_base_url` | http://127.0.0.1:8000/v1 | oMLX OpenAI-compatible API URL; dashboard/root URLs are normalized |
 | `captioning.omlx_model` | null | oMLX model ID; falls back to `MLX_MODEL`/`OMLX_MODEL`/`LLM_MODEL` env vars or `default` |
 | `captioning.batch_size` | 4 | Concurrent oMLX caption requests per chunk |
-| `captioning.max_tokens` | 1024 | Max tokens per caption |
+| `captioning.max_tokens` | 32768 | Max tokens per caption |
+| `captioning.disable_thinking` | true | Disable reasoning so the caption budget is used for the visible answer |
 | `embedding.model_name` | ViT-B-32 | CLIP model |
 | `embedding.device` | mps | Apple Silicon GPU |
 
