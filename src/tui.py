@@ -77,6 +77,7 @@ def _summary_rows(config: ScreenLensConfig, config_path: Path | None) -> list[tu
         ("Model", _model_label(config)),
         ("Batch size", str(config.captioning.batch_size)),
         ("Caption tokens", f"{config.captioning.max_tokens:,}"),
+        ("Reconstruct timeout", f"{config.reconstruction.timeout_seconds:g}s"),
         ("Inference URL", inference_url),
         ("Inference key", inference_key),
         ("Embedding", f"{config.embedding.model_name} on {config.embedding.device}"),

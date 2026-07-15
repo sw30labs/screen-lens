@@ -689,6 +689,12 @@ class OpenAICompatibleClient:
                 f"{self.backend.value} chat completion failed with HTTP "
                 f"{exc.code}: {detail}{hint}"
             ) from exc
+        except TimeoutError as exc:
+            raise RuntimeError(
+                f"{self.backend.value} chat completion timed out after "
+                f"{self.timeout:g} seconds. Increase the configured request "
+                "timeout if this local model needs longer."
+            ) from exc
         except URLError as exc:
             raise RuntimeError(
                 f"Could not connect to {self.backend.value} at {self.base_url}. "

@@ -34,7 +34,10 @@ greedily pack captions by serialized size and split an individually oversized
 caption; they do not assume every frame caption is near the global average.
 The shared extraction pass requests at most 1,400 output tokens while retaining
 the server's entire context as completion headroom. Recursive synthesis filters
-notes to the current file or artifact and uses the same full ceiling. A group
+notes to the current file or artifact and uses the same full ceiling. Long
+reconstruction calls have an independent 1,800-second HTTP timeout, configurable
+as `reconstruction.timeout_seconds`, so they do not inherit the shorter caption
+request budget. A group
 that still ends with `finish_reason=length` is discarded and retried with less
 input; incomplete prefixes never flow into later passes. If the endpoint and
 `VLLM_MAX_MODEL_LEN` are upgraded together, reconstruction automatically uses a

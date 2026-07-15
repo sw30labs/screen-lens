@@ -407,7 +407,13 @@ class ReconstructionConfig(BaseModel):
         ),
     )
     api_key: Optional[str] = Field(default=None)
-    timeout_seconds: float = Field(default=600.0)
+    timeout_seconds: float = Field(
+        default=1800.0,
+        description=(
+            "HTTP timeout for long-running text reconstruction requests. "
+            "Kept separate from the shorter per-frame caption timeout."
+        ),
+    )
     temperature: float = Field(default=0.0)
     max_tokens: int = Field(default=8192)
     model_context: int = Field(default=32768, description="Assumed context window for chunk planning")

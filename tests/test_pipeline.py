@@ -47,6 +47,7 @@ class TestConfig:
         assert config.captioning.disable_thinking is True
         assert config.captioning.max_tokens == 32768
         assert config.captioning.batch_size == 2
+        assert config.reconstruction.timeout_seconds == 1800
         assert config.ocr.backend == InferenceBackend.vllm
         assert config.frame_extraction.fps == 1.0
         assert config.embedding.device == "cuda"
@@ -232,6 +233,7 @@ class TestOMLXClient:
 
         assert rows["Inference URL"] == config.captioning.ollama_base_url
         assert rows["Inference key"] == "n/a"
+        assert rows["Reconstruct timeout"] == "1800s"
 
     def test_vllm_defaults_and_legacy_env_isolation(self, monkeypatch):
         from src.config import CaptionBackend, CaptioningConfig, OCRConfig, ReconstructionConfig
@@ -555,6 +557,26 @@ class TestOMLXClient:
                 max_tokens=2048,
                 require_complete=True,
             )
+
+    def test_chat_timeout_reports_effective_request_budget(self, monkeypatch):
+        from src.omlx_client import InferenceClient
+        import src.omlx_client as inference_client
+
+        def raise_timeout(req, timeout):
+            assert timeout == 1800
+            raise TimeoutError("timed out")
+
+        monkeypatch.setattr(inference_client, "_urlopen", raise_timeout)
+        client = InferenceClient.from_endpoint(
+            base_url="http://127.0.0.1:8000/v1",
+            model="vision-model",
+            api_key="local",
+            backend="vllm",
+            timeout=1800,
+        )
+
+        with pytest.raises(RuntimeError, match="timed out after 1800 seconds"):
+            client.chat("system", "user")
 
 
 class TestCaptioner:
@@ -1135,6 +1157,23 @@ class TestPipeline:
 
         assert 1 <= len(calls) <= 4
 
+    @pytest.mark.parametrize("backend", ["vllm", "omlx"])
+    def test_direct_caption_config_uses_reconstruction_timeout(self, backend):
+        import src.reconstruct as reconstruct
+        from src.config import CaptionBackend, ScreenLensConfig
+
+        config = ScreenLensConfig()
+        config.captioning.backend = CaptionBackend(backend)
+        config.captioning.vllm_timeout_seconds = 120
+        config.captioning.omlx_timeout_seconds = 120
+        config.reconstruction.timeout_seconds = 2400
+
+        direct = reconstruct._reconstruction_captioning_config(config)
+
+        assert direct.backend == CaptionBackend(backend)
+        assert direct.vllm_timeout_seconds == (2400 if backend == "vllm" else 120)
+        assert direct.omlx_timeout_seconds == (2400 if backend == "omlx" else 120)
+
     def test_ollama_caption_config_uses_direct_reconstruction_backend(self):
         import src.reconstruct as reconstruct
         from src.config import CaptionBackend, InferenceBackend, ScreenLensConfig
@@ -1150,4 +1189,5 @@ class TestPipeline:
         assert direct.backend == CaptionBackend.vllm
         assert direct.vllm_model == "org/reconstruction-model"
         assert direct.vllm_api_key == "direct-key"
+        assert direct.vllm_timeout_seconds == config.reconstruction.timeout_seconds
         assert direct.max_tokens == config.reconstruction.max_tokens

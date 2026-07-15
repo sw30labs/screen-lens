@@ -253,27 +253,32 @@ _MODEL_CACHE: dict = {}
 
 
 def _reconstruction_captioning_config(config: ScreenLensConfig):
-    """Return a direct-provider config even when captions came from Ollama."""
+    """Return a direct-provider config with the reconstruction time budget."""
     captioning = config.captioning
-    if captioning.backend != CaptionBackend.ollama:
-        return captioning
-
     direct = captioning.model_copy(deep=True)
     reconstruction = config.reconstruction
-    direct.backend = CaptionBackend(reconstruction.backend.value)
-    direct.max_tokens = reconstruction.max_tokens
+
+    if captioning.backend == CaptionBackend.ollama:
+        direct.backend = CaptionBackend(reconstruction.backend.value)
+        direct.max_tokens = reconstruction.max_tokens
+        if direct.backend == CaptionBackend.vllm:
+            direct.vllm_base_url = reconstruction.base_url
+            direct.vllm_model = reconstruction.model
+            direct.vllm_api_key = reconstruction.api_key
+            direct.vllm_model_context = reconstruction.model_context
+        else:
+            direct.omlx_base_url = reconstruction.base_url
+            direct.omlx_model = reconstruction.model
+            direct.omlx_api_key = reconstruction.api_key
+            direct.omlx_model_context = reconstruction.model_context
+
+    # Artifact synthesis is a substantially longer generation than a frame
+    # caption. Apply its independent timeout even when both stages use the same
+    # direct endpoint and model.
     if direct.backend == CaptionBackend.vllm:
-        direct.vllm_base_url = reconstruction.base_url
-        direct.vllm_model = reconstruction.model
-        direct.vllm_api_key = reconstruction.api_key
         direct.vllm_timeout_seconds = reconstruction.timeout_seconds
-        direct.vllm_model_context = reconstruction.model_context
     else:
-        direct.omlx_base_url = reconstruction.base_url
-        direct.omlx_model = reconstruction.model
-        direct.omlx_api_key = reconstruction.api_key
         direct.omlx_timeout_seconds = reconstruction.timeout_seconds
-        direct.omlx_model_context = reconstruction.model_context
     return direct
 
 
@@ -286,6 +291,7 @@ def get_inference_client(config: ScreenLensConfig) -> InferenceClient:
         client.base_url,
         client.model,
         client.api_key,
+        client.timeout,
     )
     if key not in _MODEL_CACHE:
         print(f"Using {client.backend.value} model: {client.model} at {client.base_url}")
