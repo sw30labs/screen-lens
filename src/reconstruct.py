@@ -750,8 +750,13 @@ def plan_node(state: ReconstructState) -> dict:
         sampled = _stratified_sample(captions, 60)
         sample_block = _build_caption_block(sampled, max_chars=80000)
         file_id_prompt = f"Frame captions from a Python coding session:\n\n{sample_block}"
+        # The file list is unbounded — one entry per Python file visible, each
+        # with a description and key_content — so it cannot share the classifier's
+        # small fixed cap. Let the model run to its natural stop.
+        plan_ceiling = _long_form_output_ceiling(client, _get_model_context_size(client))
         response = generate_text(client, PLAN_PYTHON_SYSTEM,
-                                  file_id_prompt, max_tokens=1024, temperature=0.1)
+                                  file_id_prompt, max_tokens=plan_ceiling,
+                                  temperature=0.1)
         plan = parse_json_response(response)
 
         files = plan.get("files", [{"filename": "reconstructed.py",
@@ -1011,8 +1016,11 @@ def qa_reflect_node(state: ReconstructState) -> dict:
         f"RECONSTRUCTED ARTIFACTS:\n{artifacts_text}"
     )
 
+    # feedback + per-artifact scores + missing_elements grow with the artifact
+    # set, so this JSON has no small fixed bound either.
+    qa_ceiling = _long_form_output_ceiling(client, _get_model_context_size(client))
     response = generate_text(client, QA_REFLECT_SYSTEM, user_prompt,
-                              max_tokens=1024, temperature=0.1)
+                              max_tokens=qa_ceiling, temperature=0.1)
     result = parse_json_response(response)
 
     passed = result.get("passed", True)
