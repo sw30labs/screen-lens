@@ -36,11 +36,11 @@ services:
       - "1"
       - --trust-remote-code
       - --kv-cache-dtype
-      - fp8
+      - "${VLLM_KV_CACHE_DTYPE:-fp8}"
       - --attention-backend
       - flashinfer
       - --quantization
-      - modelopt
+      - "${VLLM_QUANTIZATION:-modelopt}"
       - --gpu-memory-utilization
       - "${VLLM_GPU_MEMORY_UTILIZATION:-0.45}"
       - --max-model-len

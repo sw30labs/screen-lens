@@ -213,6 +213,8 @@ All settings live in `src/config.py` as Pydantic models. Key parameters:
 | `captioning.omlx_model` | null | Falls back to `MLX_MODEL`/`OMLX_MODEL`/`LLM_MODEL`, then `default` |
 | `captioning.batch_size` | 2 DGX / 4 Apple | Concurrent direct-server caption requests |
 | `captioning.max_tokens` | 32768 | Requested caption ceiling; vLLM uses the context remaining after image/prompt tokens |
+| `captioning.retry_attempts` | 1 | Per-frame retries after a direct caption request fails |
+| `captioning.retry_max_tokens` | 2048 | Bounded retry ceiling that prevents malformed generations from consuming another full caption budget |
 | `captioning.repetition_penalty` | 1.05 | Discourage pathological long caption loops |
 | `captioning.no_repeat_ngram_size` | 12 | Block repeated long caption sequences; `0` disables |
 | `captioning.disable_thinking` | true | Spend the output budget on the visible answer |
@@ -225,7 +227,7 @@ All settings live in `src/config.py` as Pydantic models. Key parameters:
 
 ## Performance Notes
 
-Direct backends receive one OpenAI-compatible image request per frame. Image encoding and prompt prefill usually dominate short captions, so the main levers are frame dimensions, model size, and request concurrency. The bundled Spark service admits two sequences and ScreenLens therefore defaults to two requests there. Apple defaults to four, but large oMLX models may benefit from a lower value.
+Direct backends receive one OpenAI-compatible image request per frame. Image encoding and prompt prefill usually dominate short captions, so the main levers are frame dimensions, model size, and request concurrency. The bundled Spark service admits two sequences and ScreenLens therefore defaults to two requests there. Apple defaults to four, but large oMLX models may benefit from a lower value. Concurrent results are isolated per frame: one failed request cannot overwrite a successful peer in the same chunk. A failed frame is retried once deterministically with a bounded 2K completion ceiling. A retry that fills that ceiling without terminating is rejected instead of storing a truncated loop; ScreenLens stores an error marker for that frame alone.
 
 DGX Spark has one 128 GB unified-memory pool rather than separate system RAM and VRAM. The checked single-service recipe uses the dense NVFP4 27B model, a `0.45` vLLM allocator target, a 262K context, and concurrency two. Caption requests retain a 32K output ceiling, leaving the rest of the served window for prompt, chat-template, and image tokens. If a service is deliberately reduced to a matching 32K context, ScreenLens omits the literal output limit and lets vLLM allocate the exact context remaining after its input.
 

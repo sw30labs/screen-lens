@@ -32,7 +32,14 @@ class OpenAICompatibleCaptioner:
         validate_vision_model(resolve_inference_model(config))
         self._client = InferenceClient(config)
 
-    def caption(self, image_path: str) -> str:
+    def caption(
+        self,
+        image_path: str,
+        *,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        require_complete: bool = False,
+    ) -> str:
         """Generate a caption for a single frame."""
         extra = {
             "repetition_penalty": self.config.repetition_penalty,
@@ -44,18 +51,60 @@ class OpenAICompatibleCaptioner:
             self.config.system_prompt,
             self.config.user_prompt,
             images=[image_path],
-            max_tokens=self.config.max_tokens,
-            temperature=self.config.temperature,
+            max_tokens=max_tokens if max_tokens is not None else self.config.max_tokens,
+            temperature=(
+                temperature if temperature is not None else self.config.temperature
+            ),
             extra=extra,
+            require_complete=require_complete,
         )
 
+    def _caption_with_retry(self, image_path: str) -> str:
+        """Caption one frame without allowing its failure to poison a batch."""
+        try:
+            return self.caption(image_path)
+        except Exception as exc:
+            last_error = exc
+
+        retry_max_tokens = min(
+            self.config.max_tokens,
+            self.config.retry_max_tokens,
+        )
+        for attempt in range(1, self.config.retry_attempts + 1):
+            logger.warning(
+                "Caption request failed for %s (%s); retrying %s/%s with "
+                "max_tokens=%s",
+                Path(image_path).name,
+                last_error,
+                attempt,
+                self.config.retry_attempts,
+                retry_max_tokens,
+            )
+            try:
+                return self.caption(
+                    image_path,
+                    max_tokens=retry_max_tokens,
+                    temperature=0.0,
+                    require_complete=True,
+                )
+            except Exception as exc:
+                last_error = exc
+
+        logger.error(
+            "Caption request failed for %s after %s retries: %s",
+            Path(image_path).name,
+            self.config.retry_attempts,
+            last_error,
+        )
+        return f"[Error captioning frame: {last_error}]"
+
     def caption_batch(self, image_paths: list[str]) -> list[str]:
-        """Submit concurrent requests and preserve input order."""
+        """Submit isolated concurrent requests and preserve input order."""
         if not image_paths:
             return []
         max_workers = max(1, min(self.config.batch_size, len(image_paths)))
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            return list(pool.map(self.caption, image_paths))
+            return list(pool.map(self._caption_with_retry, image_paths))
 
 
 # ── Ollama Backend ──────────────────────────────────────────────────────────

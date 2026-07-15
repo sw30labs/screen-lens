@@ -208,6 +208,19 @@ class CaptioningConfig(BaseModel):
             "remaining after the prompt and image."
         ),
     )
+    retry_attempts: int = Field(
+        default=1,
+        ge=0,
+        description="Per-frame retries after a direct caption request fails",
+    )
+    retry_max_tokens: int = Field(
+        default=2048,
+        ge=1,
+        description=(
+            "Bounded output-token ceiling for a retried caption request, used to "
+            "prevent a malformed generation from consuming the full normal budget"
+        ),
+    )
     repetition_penalty: float = Field(
         default=1.05,
         description="Lightly discourage degenerate long-form caption repetition",

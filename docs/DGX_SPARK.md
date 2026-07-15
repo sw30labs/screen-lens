@@ -32,6 +32,13 @@ Direct captions also use light repetition controls so a malformed generation
 cannot consume that entire ceiling by looping. Later reconstruction stages
 greedily pack captions by serialized size and split an individually oversized
 caption; they do not assume every frame caption is near the global average.
+Caption failures are isolated per frame, so a timed-out request cannot discard
+the successful result beside it in the same two-request chunk. ScreenLens
+retries only the failed frame once with a 2,048-token ceiling (configurable as
+`captioning.retry_attempts` and `captioning.retry_max_tokens`) before recording
+an error marker for that frame and continuing. Retries use deterministic
+decoding and must terminate naturally within the bounded ceiling; a truncated
+loop is not accepted as a caption.
 The shared extraction pass requests at most 1,400 output tokens while retaining
 the server's entire context as completion headroom. Recursive synthesis filters
 notes to the current file or artifact and uses the same full ceiling. Long
@@ -213,6 +220,8 @@ values take precedence.
 | `VLLM_IMAGE` | validated `vllm/vllm-openai@sha256:…` digest | ARM64 vLLM image; override deliberately when validating an upgrade |
 | `VLLM_MODEL` | `nvidia/Qwen3.6-27B-NVFP4` | Served and requested dense multimodal model id |
 | `VLLM_MODEL_REVISION` | pinned SHA above | Reproducible model contents |
+| `VLLM_QUANTIZATION` | `modelopt` | vLLM quantization backend; use `fp8` with `Qwen/Qwen3.6-27B-FP8` |
+| `VLLM_KV_CACHE_DTYPE` | `fp8` | KV-cache precision; use `auto` when a checkpoint lacks calibrated FP8 KV scales |
 | `VLLM_BASE_URL` | `http://127.0.0.1:8000/v1` | OpenAI-compatible API root |
 | `VLLM_API_KEY` | `local` | Placeholder for loopback, or bearer token for an externally authenticated endpoint |
 | `VLLM_GPU_MEMORY_UTILIZATION` | `0.45` | vLLM allocator target sized for the long FP8 KV cache |

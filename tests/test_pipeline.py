@@ -46,6 +46,8 @@ class TestConfig:
         assert config.captioning.vllm_base_url == "http://127.0.0.1:8000/v1"
         assert config.captioning.disable_thinking is True
         assert config.captioning.max_tokens == 32768
+        assert config.captioning.retry_attempts == 1
+        assert config.captioning.retry_max_tokens == 2048
         assert config.captioning.batch_size == 2
         assert config.reconstruction.timeout_seconds == 1800
         assert config.ocr.backend == InferenceBackend.vllm
@@ -67,6 +69,8 @@ class TestConfig:
         config = ScreenLensConfig()
         assert config.captioning.backend == CaptionBackend.omlx
         assert config.captioning.max_tokens == 32768
+        assert config.captioning.retry_attempts == 1
+        assert config.captioning.retry_max_tokens == 2048
         assert config.captioning.batch_size == 4
         assert config.embedding.device == "mps"
 

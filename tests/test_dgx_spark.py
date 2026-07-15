@@ -113,11 +113,23 @@ def test_compose_recipe_is_loopback_only_and_bounded():
     assert "platform: linux/arm64" in compose
     assert "vllm/vllm-openai@sha256:" in compose
     assert "nvidia/Qwen3.6-27B-NVFP4" in compose
+    assert '"${VLLM_QUANTIZATION:-modelopt}"' in compose
+    assert '"${VLLM_KV_CACHE_DTYPE:-fp8}"' in compose
     assert '"${VLLM_MAX_MODEL_LEN:-262144}"' in compose
     assert '"method":"mtp"' in compose
     assert "--moe-backend" not in compose
     assert "--max-num-seqs" in compose
     assert '      - "2"' in compose
+
+
+def test_dgx_helper_accepts_a_model_specific_quantization_override():
+    helper = (ROOT / "setup_and_run_dgx.sh").read_text(encoding="utf-8")
+
+    assert "[VLLM_QUANTIZATION]=1" in helper
+    assert "[VLLM_KV_CACHE_DTYPE]=1" in helper
+    assert 'VLLM_QUANTIZATION="${VLLM_QUANTIZATION:-modelopt}"' in helper
+    assert 'VLLM_KV_CACHE_DTYPE="${VLLM_KV_CACHE_DTYPE:-fp8}"' in helper
+    assert "export VLLM_MODEL VLLM_MODEL_REVISION VLLM_QUANTIZATION" in helper
 
 
 def test_dgx_smoke_uses_a_real_screen_image():
