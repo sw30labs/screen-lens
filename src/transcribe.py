@@ -8,9 +8,8 @@ Verbatim transcription pipeline (the new primary path).
       → LLM cleanup       (seams + indentation ONLY, optional)     this file
       → output/transcript.md
 
-Everything is local: vision OCR + text cleanup both go through the oMLX
-OpenAI-compatible server. The two models are intentionally separate — a vision
-model reads the pixels, a text model tidies seams.
+Everything is local: vision OCR + text cleanup both use the selected
+OpenAI-compatible server (vLLM on DGX Spark or oMLX on Apple Silicon).
 """
 from __future__ import annotations
 
@@ -23,7 +22,14 @@ from pathlib import Path
 from .config import ScreenLensConfig
 from .frame_select import select_frames
 from .ocr import VerbatimOCR
-from .omlx_client import OMLXClient, normalize_omlx_base_url, resolve_llm_model, _env_value
+from .omlx_client import (
+    InferenceClient,
+    resolve_llm_model,
+    resolve_role_api_key,
+    resolve_role_backend,
+    resolve_role_base_url,
+    resolve_role_context,
+)
 from .stitch import stitch_frames
 
 logger = logging.getLogger("screenlens.transcribe")
@@ -66,15 +72,15 @@ CLEANUP_SYSTEM = (
 )
 
 
-def _llm_client(cfg) -> OMLXClient:
+def _llm_client(cfg) -> InferenceClient:
     rc = cfg.reconstruction
-    api_key = rc.api_key or _env_value("LLM_API_KEY", "MLX_API_KEY", "OMLX_API_KEY",
-                                       ignore_placeholders=True)
-    return OMLXClient.from_endpoint(
-        base_url=normalize_omlx_base_url(rc.base_url),
+    return InferenceClient.from_endpoint(
+        base_url=resolve_role_base_url(rc),
         model=resolve_llm_model(rc),
-        api_key=api_key,
+        api_key=resolve_role_api_key(rc, "VLLM_LLM_API_KEY", "LLM_API_KEY"),
+        backend=resolve_role_backend(rc),
         timeout=rc.timeout_seconds,
+        context_size=resolve_role_context(rc),
         default_max_tokens=rc.max_tokens,
         default_temperature=rc.temperature,
     )

@@ -198,7 +198,7 @@ def test_ocr_disables_thinking_in_request_payload(monkeypatch, tmp_path):
         captured["payload"] = json.loads(req.data.decode("utf-8"))
         return FakeResponse()
 
-    monkeypatch.setattr(omlx_client.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(omlx_client, "_urlopen", fake_urlopen)
 
     ocr = VerbatimOCR(OCRConfig(model="Qwen3-VL-test", disable_thinking=True))
     assert ocr.ocr_frame(str(img_path)) == "hello"
@@ -242,7 +242,7 @@ def test_cleanup_falls_back_to_raw_when_llm_drops_content(monkeypatch):
                 {"choices": [{"message": {"content": "keep_line_0 = 0"}}]}
             ).encode()
 
-    monkeypatch.setattr(omlx_client.request, "urlopen", lambda req, timeout: FakeResponse())
+    monkeypatch.setattr(omlx_client, "_urlopen", lambda req, timeout: FakeResponse())
 
     cfg = ScreenLensConfig()
     out = T._cleanup_transcript(raw, cfg)
